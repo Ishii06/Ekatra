@@ -1,0 +1,16 @@
+# Ekatra — core dependencies
+
+# Workflow and state orchestration (ADR-001)
+langgraph==1.2.11
+
+# LLM integration via Google Gemini (ADR-006)
+langchain-core==1.6.3
+google-genai==2.24.0
+
+# Configuration and validation
+pydantic==2.13.0
+pydantic-settings==2.15.0
+python-dotenv==1.2.2
+
+# Testing
+pytest==8.4.2
