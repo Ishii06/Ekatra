@@ -265,7 +265,7 @@ export function AdaptiveControllerPanel() {
                   className="rounded-xl border border-dashed border-line-soft px-3 py-6 text-center"
                 >
                   <div className="mono text-[10px] uppercase tracking-[0.2em] text-fg-dim">
-                    Awaiting first evaluation cycle
+                    NO ADAPTATION REQUIRED
                   </div>
                 </motion.div>
               )}

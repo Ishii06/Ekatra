@@ -1,6 +1,6 @@
 "use client";
 
-import { FlaskConical, Pause, Play, Sparkles } from "lucide-react";
+import { FlaskConical, Network, Pause, Play, Sparkles } from "lucide-react";
 import { useDashboard } from "@/lib/dashboard-context";
 import { cn } from "@/lib/cn";
 import { Chip } from "./ui";
@@ -85,6 +85,8 @@ export function SiteHeader() {
     toggle,
     provenanceLabel,
     isDemo,
+    isLive,
+    liveError,
   } = useDashboard();
 
   const activeScenarioName =
@@ -112,7 +114,18 @@ export function SiteHeader() {
         </div>
 
         <div className="ml-auto flex flex-wrap items-center gap-2.5">
-          <StatusIndicator playing={playing} isDemo={isDemo} label={provenanceLabel} />
+          <StatusIndicator
+            playing={playing}
+            isDemo={isDemo}
+            isLive={isLive}
+            label={provenanceLabel}
+          />
+          {liveError && (
+            <Chip tone="amber">
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber" />
+              BACKEND OFFLINE
+            </Chip>
+          )}
 
           <label className="sr-only" htmlFor="scenario-select">
             Scenario
@@ -142,10 +155,15 @@ export function SiteHeader() {
                 label: "Experiment",
                 icon: <FlaskConical className="h-3 w-3" />,
               },
+              {
+                value: "live",
+                label: "Live Backend",
+                icon: <Network className="h-3 w-3" />,
+              },
             ]}
           />
 
-          {mode === "experiment" && (
+          {(mode === "experiment" || mode === "live") && (
             <Segmented
               ariaLabel="Strategy"
               value={strategy}
@@ -168,12 +186,16 @@ export function SiteHeader() {
           >
             {playing ? (
               <>
-                <Pause className="h-3.5 w-3.5" /> Pause
+                <Pause className="h-3.5 w-3.5" /> {isLive ? "Stop" : "Pause"}
               </>
             ) : (
               <>
                 <Play className="h-3.5 w-3.5" />
-                {mode === "demo" ? "Run Demo" : "Play Run"}
+                {mode === "demo"
+                  ? "Run Demo"
+                  : mode === "live"
+                    ? "Run"
+                    : "Play Run"}
               </>
             )}
           </button>
@@ -186,10 +208,12 @@ export function SiteHeader() {
 function StatusIndicator({
   playing,
   isDemo,
+  isLive,
   label,
 }: {
   playing: boolean;
   isDemo: boolean;
+  isLive: boolean;
   label: string;
 }) {
   return (
@@ -203,7 +227,9 @@ function StatusIndicator({
         />
         {label}
       </Chip>
-      {playing && <Chip tone="accent">LIVE PLAYBACK</Chip>}
+      {playing && (
+        <Chip tone="accent">{isLive ? "RUNNING" : "LIVE PLAYBACK"}</Chip>
+      )}
     </div>
   );
 }

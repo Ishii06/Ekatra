@@ -20,7 +20,7 @@ PROJECT = "Build a simple todo application."
 
 
 def _no_key() -> Settings:
-    return Settings(_env_file=None, gemini_api_key="", gemini_model="gemini-2.5-flash")
+    return Settings(_env_file=None, gemini_api_key="", gemini_model="gemini-3.5-flash")
 
 
 # -- 1. Gemini configuration loads -----------------------------------------
@@ -31,7 +31,7 @@ class TestGeminiConfiguration:
         settings = _no_key()
         assert settings.llm_provider == "gemini"
         assert settings.gemini_api_key == ""
-        assert settings.gemini_model == "gemini-2.5-flash"
+        assert settings.gemini_model == "gemini-3.5-flash"
         assert settings.has_api_key() is False
 
     def test_cached_settings_are_gemini(self):
@@ -133,7 +133,7 @@ class TestClientInitialization:
         from ekatra.llm.gemini import generate_text
 
         out = generate_text("ping", settings=_no_key())
-        assert captured == {"model": "gemini-2.5-flash", "contents": "ping"}
+        assert captured == {"model": "gemini-3.5-flash", "contents": "ping"}
         assert out == "mock gemini output"
 
 

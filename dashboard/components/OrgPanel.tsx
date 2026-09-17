@@ -159,7 +159,7 @@ export function OrgPanel() {
             const active =
               activeRole(edge.from) ||
               activeRole(edge.to) ||
-              justSpawned === `${edge.to.toUpperCase()}-2`;
+              justSpawnedId === `${edge.to.toUpperCase()}-2`;
             return (
               <EdgePath
                 key={`${edge.from}-${edge.to}`}

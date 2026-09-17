@@ -26,7 +26,7 @@ into active source code. The team standardized on Gemini via the first-party
   `GEMINI_API_KEY` configuration.
 * No third-party orchestration wrapper needed for the provider call path;
   LangGraph remains the workflow orchestrator and is untouched.
-* Gemini 2.5 Flash (`gemini-2.5-flash`) is a stable, GA model offering the
+* Gemini 2.5 Flash (`gemini-3.5-flash`) is a stable, GA model offering the
   best price-performance for agentic use cases.
 
 ## Configuration
@@ -34,7 +34,7 @@ into active source code. The team standardized on Gemini via the first-party
 * `LLM_PROVIDER=gemini` — the only implemented provider.
 * `GEMINI_API_KEY=...` — read from the environment or `.env`; an empty value
   means no LLM calls are made (mock/tools strategies remain fully functional).
-* `GEMINI_MODEL=gemini-2.5-flash` — default model; runtime-configurable for
+* `GEMINI_MODEL=gemini-3.5-flash` — default model; runtime-configurable for
   experiments, as before.
 
 The key is never logged, never serialized into experiment records, snapshots,

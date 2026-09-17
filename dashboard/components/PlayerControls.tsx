@@ -19,6 +19,8 @@ export function PlayerControls() {
     atStart,
     atEnd,
     isDemo,
+    isLive,
+    liveError,
     intervalMs,
   } = useDashboard();
 
@@ -38,7 +40,7 @@ export function PlayerControls() {
           </button>
           <button
             onClick={stepBack}
-            disabled={atStart}
+            disabled={atStart || isLive}
             className="flex h-8 w-8 items-center justify-center rounded-lg border border-line-soft text-fg-muted transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-40"
             aria-label="Previous step"
           >
@@ -47,18 +49,24 @@ export function PlayerControls() {
           <button
             onClick={toggle}
             className={cn(
-              "flex h-9 w-9 items-center justify-center rounded-lg border transition-all",
+              "flex h-9 items-center justify-center gap-1.5 rounded-lg border px-2.5 transition-all",
+              !isLive && "w-9 px-0",
               playing
                 ? "border-amber/50 bg-amber/10 text-amber"
                 : "border-accent/50 bg-accent/15 text-accent hover:bg-accent/25",
             )}
-            aria-label={playing ? "Pause" : "Play"}
+            aria-label={playing ? (isLive ? "Stop" : "Pause") : isLive ? "Run" : "Play"}
           >
             {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+            {isLive && (
+              <span className="mono text-[10px] font-semibold uppercase tracking-[0.14em]">
+                {playing ? "Running" : "Run"}
+              </span>
+            )}
           </button>
           <button
             onClick={stepForward}
-            disabled={atEnd}
+            disabled={atEnd || isLive}
             className="flex h-8 w-8 items-center justify-center rounded-lg border border-line-soft text-fg-muted transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-40"
             aria-label="Next step"
           >
@@ -68,19 +76,42 @@ export function PlayerControls() {
 
         <div className="min-w-0 flex-1">
           <div className="mono text-[9px] uppercase tracking-[0.2em] text-accent/80">
-            {isDemo ? "Demo walkthrough" : "Recorded run playback"}
+            {isDemo
+              ? "Demo walkthrough"
+              : isLive
+                ? "Live backend run"
+                : "Recorded run playback"}
           </div>
           <div className="truncate text-[13px] font-medium text-fg">{title}</div>
-          {frame?.narrative && (
-            <div className="truncate text-[11px] text-fg-dim">{frame.narrative}</div>
+          {liveError ? (
+            <div className="truncate text-[11px] text-red-400">
+              Backend error: {liveError}
+            </div>
+          ) : (
+            frame?.narrative && (
+              <div className="truncate text-[11px] text-fg-dim">
+                {frame.narrative}
+              </div>
+            )
           )}
         </div>
 
         <div className="mono shrink-0 text-right text-[10px] uppercase tracking-[0.14em] text-fg-dim">
-          <div>
-            Step {frameIndex + 1} / {totalFrames || 1}
-          </div>
-          <div>{playing ? `auto · ${intervalMs / 1000}s` : "paused"}</div>
+          {isLive ? (
+            <>
+              <div>Live backend</div>
+              <div>
+                {playing ? `polling · ${intervalMs / 1000}s` : "idle"}
+              </div>
+            </>
+          ) : (
+            <>
+              <div>
+                Step {frameIndex + 1} / {totalFrames || 1}
+              </div>
+              <div>{playing ? `auto · ${intervalMs / 1000}s` : "paused"}</div>
+            </>
+          )}
         </div>
       </div>
 

@@ -8,7 +8,14 @@ import {
   useMemo,
   useState,
 } from "react";
-import type { Mode, OrgSnapshot, RoleKey, Strategy, TaskStatus } from "./types";
+import type {
+  Level,
+  Mode,
+  OrgSnapshot,
+  RoleKey,
+  Strategy,
+  TaskStatus,
+} from "./types";
 import { buildDemoFrames } from "./data/demo";
 import {
   buildExperimentFrames,
@@ -22,7 +29,11 @@ import {
   type ScenarioDef,
 } from "./data/scenarios";
 
-export type DataSource = "demo" | "experiment";
+import { getHealth, getScenarios, startRun, getRun } from "./api/client";
+import { convertRunStateToSnapshot } from "./api/adapter";
+import type { ApiScenario } from "./api/client";
+
+export type DataSource = "demo" | "experiment" | "live";
 
 export const ALL_TASK_STATUSES: TaskStatus[] = [
   "PENDING",
@@ -73,14 +84,17 @@ interface DashboardValue {
 
   /* provenance */
   isDemo: boolean;
+  isLive: boolean;
   provenanceLabel: string;
   spawnRole: RoleKey | null;
+  liveError: string | null;
 }
 
 const DashboardContext = createContext<DashboardValue | null>(null);
 
 const DEMO_INTERVAL_MS = 2800;
 const EXPERIMENT_INTERVAL_MS = 1600;
+const LIVE_POLL_MS = 800;
 
 export function DashboardProvider({ children }: { children: React.ReactNode }) {
   const [mode, setMode] = useState<DataSource>("demo");
@@ -95,24 +109,150 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
   );
 
   const m8Scenarios = useMemo(() => listM8Scenarios(), []);
+  const [liveSnapshot, setLiveSnapshot] = useState<OrgSnapshot | null>(null);
+  const [liveSnapshotKey, setLiveSnapshotKey] = useState<string | null>(null);
+  const [liveScenarios, setLiveScenarios] = useState<ApiScenario[]>([]);
+  const [liveError, setLiveError] = useState<string | null>(null);
+
+  /* In live mode the scenario catalogue is served by the FastAPI backend. */
+  const scenarios = useMemo<ScenarioDef[]>(() => {
+    if (mode === "live" && liveScenarios.length > 0) {
+      return liveScenarios.map((s) => {
+        const expected = s.expected_characteristics ?? {};
+        return {
+          id: s.scenario_id,
+          name: s.name,
+          short: s.name,
+          description: s.description,
+          spawnRole: (expected.adaptive_spawn_role ?? null) as RoleKey | null,
+          risk: (expected.adaptive_risk_level ?? "NORMAL") as Level,
+          workload: (expected.adaptive_workload_level ?? "NORMAL") as Level,
+          demo: false,
+        };
+      });
+    }
+    return SCENARIOS;
+  }, [mode, liveScenarios]);
+
+  const scenario = useMemo(
+    () =>
+      scenarios.find((s) => s.id === scenarioId) ??
+      scenarios[0] ??
+      scenarioById(scenarioId),
+    [scenarios, scenarioId],
+  );
+
+  /* Probe backend connectivity and load scenarios when live mode is entered. */
+  useEffect(() => {
+    if (mode !== "live") return;
+    let cancelled = false;
+    getHealth()
+      .then(() => getScenarios())
+      .then((list) => {
+        if (!cancelled) {
+          setLiveScenarios(list);
+          setLiveError(null);
+        }
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setLiveError(
+            e instanceof Error ? e.message : "Backend unavailable",
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode]);
+
+  useEffect(() => {
+    if (mode !== "live") return;
+    let cancelled = false;
+    let timer: number | null = null;
+
+    async function runLive() {
+      try {
+        const started = await startRun(scenarioId, strategy);
+        const runId = started.run_id;
+
+        async function poll() {
+          if (cancelled) return;
+          try {
+            const stateRes = await getRun(runId);
+            if (!cancelled) {
+              const snapshot = convertRunStateToSnapshot(stateRes, scenario.name);
+              setLiveSnapshot(snapshot);
+              setLiveSnapshotKey(`${scenarioId}|${strategy}`);
+              setLiveError(null);
+              if (stateRes.status === "completed" || stateRes.status === "failed") {
+                setPlaying(false);
+                return;
+              }
+            }
+          } catch (e) {
+            if (!cancelled) {
+              setLiveError(
+                e instanceof Error ? e.message : "Lost connection to backend",
+              );
+              setPlaying(false);
+            }
+            return;
+          }
+          if (playing && !cancelled) {
+            timer = window.setTimeout(poll, LIVE_POLL_MS);
+          }
+        }
+
+        poll();
+      } catch (e) {
+        if (!cancelled) {
+          setLiveError(
+            e instanceof Error ? e.message : "Failed to start live run",
+          );
+          setPlaying(false);
+        }
+      }
+    }
+
+    if (playing) {
+      runLive();
+    }
+
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [mode, scenarioId, strategy, playing, scenario.name]);
 
   const frames = useMemo<OrgSnapshot[]>(() => {
     if (mode === "experiment") {
       return buildExperimentFrames(scenarioId, strategy);
     }
+    if (mode === "live") {
+      const keyMatches = liveSnapshotKey === `${scenarioId}|${strategy}`;
+      return keyMatches && liveSnapshot ? [liveSnapshot] : [];
+    }
     return buildDemoFrames(scenarioId);
-  }, [mode, scenarioId, strategy]);
+  }, [mode, scenarioId, strategy, liveSnapshot, liveSnapshotKey]);
 
   const totalFrames = frames.length;
-  const intervalMs = mode === "demo" ? DEMO_INTERVAL_MS : EXPERIMENT_INTERVAL_MS;
+  const intervalMs =
+    mode === "demo"
+      ? DEMO_INTERVAL_MS
+      : mode === "live"
+        ? LIVE_POLL_MS
+        : EXPERIMENT_INTERVAL_MS;
 
-  /* Reset playback whenever the underlying sequence changes. */
+  /* Reset playback whenever the underlying sequence changes. Live frames are
+     replaced on each poll, so playback state must survive them. */
   useEffect(() => {
+    if (mode === "live") return;
     setFrameIndex(0);
     setPlaying(false);
     setSelectedAgentId(null);
     setSelectedTaskId(null);
-  }, [frames]);
+  }, [frames, mode]);
 
   /* Clamp index defensively. */
   useEffect(() => {
@@ -140,21 +280,26 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     return () => window.clearInterval(id);
   }, [playing, totalFrames, intervalMs, frameIndex]);
 
+  const canPlay = mode === "live" || totalFrames > 1;
+
   const play = useCallback(() => {
-    if (totalFrames <= 1) return;
-    setFrameIndex((i) => (i >= totalFrames - 1 ? 0 : i));
+    if (!canPlay) return;
+    if (totalFrames > 1) {
+      setFrameIndex((i) => (i >= totalFrames - 1 ? 0 : i));
+    }
     setPlaying(true);
-  }, [totalFrames]);
+  }, [canPlay, totalFrames]);
 
   const pause = useCallback(() => setPlaying(false), []);
   const toggle = useCallback(() => {
+    if (!canPlay) return;
     setPlaying((p) => {
       if (!p && totalFrames > 1) {
         setFrameIndex((i) => (i >= totalFrames - 1 ? 0 : i));
       }
       return !p;
     });
-  }, [totalFrames]);
+  }, [canPlay, totalFrames]);
 
   const reset = useCallback(() => {
     setPlaying(false);
@@ -202,14 +347,15 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     [],
   );
 
-  const scenario = useMemo(() => scenarioById(scenarioId), [scenarioId]);
-
   const frame = frames[frameIndex] ?? frames[frames.length - 1] ?? null;
   const isDemo = frame?.isDemo ?? mode === "demo";
 
-  const provenanceLabel = isDemo
-    ? "DEMO SCENARIO"
-    : `M8 EXPERIMENT · ${strategy.toUpperCase()}`;
+  const provenanceLabel =
+    mode === "live"
+      ? `LIVE BACKEND · ${strategy.toUpperCase()}`
+      : isDemo
+      ? "DEMO SCENARIO"
+      : `M8 EXPERIMENT · ${strategy.toUpperCase()}`;
 
   /* Keep the selected agent valid as frames advance. */
   useEffect(() => {
@@ -220,9 +366,9 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
   }, [frame, selectedAgentId]);
 
   const spawnRole =
-    mode === "demo"
-      ? scenario.spawnRole
-      : m8Scenarios.find((s) => s.id === scenarioId)?.spawnRole ?? null;
+    mode === "experiment"
+      ? m8Scenarios.find((s) => s.id === scenarioId)?.spawnRole ?? null
+      : scenario.spawnRole;
 
   const value: DashboardValue = {
     mode,
@@ -230,7 +376,7 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     scenario,
     scenarioId,
     setScenarioId,
-    scenarios: SCENARIOS,
+    scenarios,
     m8Scenarios,
     strategy,
     setStrategy,
@@ -247,7 +393,7 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     stepForward,
     stepBack,
     jumpTo,
-    atEnd: frameIndex >= totalFrames - 1,
+    atEnd: totalFrames > 0 && frameIndex >= totalFrames - 1,
     atStart: frameIndex <= 0,
     selectedAgentId,
     selectAgent,
@@ -257,8 +403,10 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     selectedTaskId,
     selectTask,
     isDemo,
+    isLive: mode === "live",
     provenanceLabel,
     spawnRole,
+    liveError,
   };
 
   return (

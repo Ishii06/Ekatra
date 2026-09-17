@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
 
     # Gemini model configuration (remains runtime-configurable for experiments).
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.5-flash"
     model_temperature: float = 0.2
 
     # Retry limit for failed tasks (experimental parameter).
