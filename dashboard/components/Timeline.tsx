@@ -31,7 +31,7 @@ const KIND_LABEL: Record<TimelineKind, string> = {
 };
 
 export function Timeline() {
-  const { frame, isDemo, playing } = useDashboard();
+  const { frame, isDemo, isLive, playing } = useDashboard();
   const events = frame?.events ?? [];
   const scrollRef = useRef<HTMLDivElement>(null);
   const count = events.length;
@@ -50,9 +50,11 @@ export function Timeline() {
       subtitle={
         isDemo
           ? "Simulated presentation events — deterministic fixture data, not an experiment run."
-          : "Reconstructed from the M8 run's recorded raw_events."
+          : isLive
+            ? "Streamed from the backend's raw observability events."
+            : "Reconstructed from the M8 run's recorded raw_events."
       }
-      actions={<Chip tone={isDemo ? "amber" : "violet"}>{isDemo ? "DEMO" : "M8 RUN"}</Chip>}
+      actions={<Chip tone={isDemo ? "amber" : "violet"}>{isDemo ? "DEMO" : isLive ? "LIVE" : "M8 RUN"}</Chip>}
       bodyClassName="p-3"
     >
       <div

@@ -94,6 +94,7 @@ function FlowPipeline() {
 
 export function Hero() {
   const { frame, isDemo, provenanceLabel, scenario, mode, strategy } = useDashboard();
+  const showStrategy = mode !== "demo";
 
   return (
     <section className="relative overflow-hidden">
@@ -134,11 +135,11 @@ export function Hero() {
           <div className="flex flex-col items-start gap-2">
             <Chip tone={isDemo ? "amber" : "violet"}>{provenanceLabel}</Chip>
             <div className="text-xs text-fg-muted">
-              Scenario:{" "}
-              <span className="text-fg">{scenario.name}</span>
+              {mode === "build" ? "Mode:" : "Scenario:"}{" "}
+              <span className="text-fg">{mode === "build" ? "Real build (Gemini)" : scenario.name}</span>
             </div>
             <div className="mono text-[10px] uppercase tracking-[0.16em] text-fg-dim">
-              Strategy · {mode === "experiment" ? strategy : "adaptive (simulated)"}
+              Strategy · {showStrategy ? strategy : "adaptive (simulated)"}
             </div>
             <div className="mono text-[10px] uppercase tracking-[0.16em] text-fg-dim">
               Project state · {frame?.projectState ?? "—"}

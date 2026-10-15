@@ -69,7 +69,7 @@ export function MetricsPanel() {
     mode === "experiment" ? buildExperimentRun(scenarioId, strategy) : null;
   const m: MetricsSummary = experimentRun?.metrics ?? frame?.metrics ?? emptyMetrics();
 
-  const isFixed = mode === "experiment" && strategy === "fixed";
+  const isFixed = mode !== "demo" && strategy === "fixed";
 
   return (
     <Panel
@@ -84,6 +84,8 @@ export function MetricsPanel() {
           </Chip>
           {mode === "experiment" ? (
             <span className="mono text-[9px] text-fg-dim">source · M8 dataset</span>
+          ) : mode === "live" || mode === "build" ? (
+            <span className="mono text-[9px] text-fg-dim">source · live backend</span>
           ) : (
             <span className="mono text-[9px] text-fg-dim">source · demo fixture</span>
           )}

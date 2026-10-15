@@ -180,6 +180,41 @@ is fast but sloppier than larger models), dead links and unfinished pages can
 remain after the repair round, and nothing is tested by actually running the
 site. Gemini rate limits (429) and overload (503) are retried with backoff.
 
+## Backend API and Dashboard
+
+```bash
+# terminal 1 - backend (from the project root)
+set PYTHONPATH=src                     # PowerShell: $env:PYTHONPATH = "src"
+uvicorn ekatra.api.app:app --port 8000
+
+# terminal 2 - dashboard
+cd dashboard
+npm install
+npm run dev                            # http://localhost:3000
+```
+
+Restart the backend after pulling changes: a server started earlier keeps running the
+old routes. The dashboard reads `NEXT_PUBLIC_API_URL` (default `http://localhost:8000`).
+
+Dashboard modes: **Demo** (scripted), **Experiment** (recorded M8 dataset), **Live Backend**
+(a scenario run through the mock-agent workflows) and **Build** — type a website
+description, press *Start build*, and watch the agents, spawns, tasks, controller
+decisions and generated files appear live. Click a file to read it; when the build
+finishes the panel shows validation issues and the commands to run the site.
+
+Build endpoints (`/api/builds`; one build may run at a time):
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/builds` `{description, strategy, repair_rounds}` | start a real build (needs `GEMINI_API_KEY`) |
+| `GET /api/builds` | recent builds, newest first |
+| `GET /api/builds/{id}` | full state: agents, tasks, decisions, workload, risk, metrics, events, files, log, issues |
+| `GET /api/builds/{id}/stream` | Server-Sent Events: one state snapshot per change, then `event: done` |
+| `GET /api/builds/{id}/files` / `.../files/{path}` | list / read generated files (confined to `backend/`, `frontend/`, `docs/`) |
+
+Scenario endpoints (`/api/scenarios`, `/api/runs...`) are unchanged. Build state is kept in
+memory, so it is lost when the backend restarts (the files in `projects/` remain).
+
 ## Experiments (simulated clock)
 
 Fixed-vs-adaptive experiments use a deterministic **simulated clock**

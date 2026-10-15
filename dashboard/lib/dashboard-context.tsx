@@ -32,8 +32,15 @@ import {
 import { getHealth, getScenarios, startRun, getRun } from "./api/client";
 import { convertRunStateToSnapshot } from "./api/adapter";
 import type { ApiScenario } from "./api/client";
+import {
+  followBuild,
+  getBuild,
+  listBuilds,
+  startBuild as apiStartBuild,
+  type BuildStateResponse,
+} from "./api/builds";
 
-export type DataSource = "demo" | "experiment" | "live";
+export type DataSource = "demo" | "experiment" | "live" | "build";
 
 export const ALL_TASK_STATUSES: TaskStatus[] = [
   "PENDING",
@@ -82,6 +89,15 @@ interface DashboardValue {
   selectedTaskId: string | null;
   selectTask: (id: string | null) => void;
 
+  /* real build (Gemini-driven) */
+  buildDescription: string;
+  setBuildDescription: (text: string) => void;
+  build: BuildStateResponse | null;
+  buildRunning: boolean;
+  buildStarting: boolean;
+  startBuild: () => Promise<void>;
+  openBuild: (buildId: string) => void;
+
   /* provenance */
   isDemo: boolean;
   isLive: boolean;
@@ -95,6 +111,8 @@ const DashboardContext = createContext<DashboardValue | null>(null);
 const DEMO_INTERVAL_MS = 2800;
 const EXPERIMENT_INTERVAL_MS = 1600;
 const LIVE_POLL_MS = 800;
+const DEFAULT_BUILD_DESCRIPTION =
+  "A student wellbeing website where students can browse counsellors, book counselling sessions, and keep a private daily mood journal with a simple mood trend chart.";
 
 export function DashboardProvider({ children }: { children: React.ReactNode }) {
   const [mode, setMode] = useState<DataSource>("demo");
@@ -113,6 +131,14 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
   const [liveSnapshotKey, setLiveSnapshotKey] = useState<string | null>(null);
   const [liveScenarios, setLiveScenarios] = useState<ApiScenario[]>([]);
   const [liveError, setLiveError] = useState<string | null>(null);
+
+  /* Real build state, fed by the backend's SSE stream. */
+  const [buildDescription, setBuildDescription] = useState(DEFAULT_BUILD_DESCRIPTION);
+  const [buildId, setBuildId] = useState<string | null>(null);
+  const [build, setBuild] = useState<BuildStateResponse | null>(null);
+  const [buildSnapshot, setBuildSnapshot] = useState<OrgSnapshot | null>(null);
+  const [buildStarting, setBuildStarting] = useState(false);
+  const buildRunning = build?.status === "running";
 
   /* In live mode the scenario catalogue is served by the FastAPI backend. */
   const scenarios = useMemo<ScenarioDef[]>(() => {
@@ -165,6 +191,55 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
       cancelled = true;
     };
   }, [mode]);
+
+  /* Build mode: check the backend and re-attach to the most recent build. */
+  useEffect(() => {
+    if (mode !== "build") return;
+    let cancelled = false;
+    getHealth()
+      .then(() => listBuilds())
+      .then((list) => {
+        if (cancelled) return;
+        setLiveError(null);
+        if (!buildId && list.length > 0) setBuildId(list[0].run_id);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled)
+          setLiveError(e instanceof Error ? e.message : "Backend unavailable");
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  /* Follow the selected build over SSE; every snapshot re-renders the panels. */
+  useEffect(() => {
+    if (mode !== "build" || !buildId) return;
+    let stopped = false;
+    const apply = (state: BuildStateResponse) => {
+      if (stopped) return;
+      setBuild(state);
+      setBuildSnapshot(convertRunStateToSnapshot(state, "Live build"));
+      setLiveError(state.error ?? null);
+    };
+    const close = followBuild(buildId, {
+      onUpdate: apply,
+      onDone: () => {
+        /* the final snapshot arrives before "done"; refresh once for certainty */
+        getBuild(buildId).then(apply).catch(() => undefined);
+      },
+      onError: (message) => {
+        if (stopped) return;
+        setLiveError(message);
+        getBuild(buildId).then(apply).catch(() => undefined);
+      },
+    });
+    return () => {
+      stopped = true;
+      close();
+    };
+  }, [mode, buildId]);
 
   useEffect(() => {
     if (mode !== "live") return;
@@ -233,21 +308,24 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
       const keyMatches = liveSnapshotKey === `${scenarioId}|${strategy}`;
       return keyMatches && liveSnapshot ? [liveSnapshot] : [];
     }
+    if (mode === "build") {
+      return buildSnapshot ? [buildSnapshot] : [];
+    }
     return buildDemoFrames(scenarioId);
-  }, [mode, scenarioId, strategy, liveSnapshot, liveSnapshotKey]);
+  }, [mode, scenarioId, strategy, liveSnapshot, liveSnapshotKey, buildSnapshot]);
 
   const totalFrames = frames.length;
   const intervalMs =
     mode === "demo"
       ? DEMO_INTERVAL_MS
-      : mode === "live"
+      : mode === "live" || mode === "build"
         ? LIVE_POLL_MS
         : EXPERIMENT_INTERVAL_MS;
 
   /* Reset playback whenever the underlying sequence changes. Live frames are
      replaced on each poll, so playback state must survive them. */
   useEffect(() => {
-    if (mode === "live") return;
+    if (mode === "live" || mode === "build") return;
     setFrameIndex(0);
     setPlaying(false);
     setSelectedAgentId(null);
@@ -289,6 +367,32 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     }
     setPlaying(true);
   }, [canPlay, totalFrames]);
+
+  const startBuild = useCallback(async () => {
+    const text = buildDescription.trim();
+    if (text.length < 10) {
+      setLiveError("Describe the website in at least 10 characters");
+      return;
+    }
+    setBuildStarting(true);
+    setLiveError(null);
+    try {
+      const started = await apiStartBuild(text, strategy);
+      setBuild(null);
+      setBuildSnapshot(null);
+      setBuildId(started.run_id);
+    } catch (e) {
+      setLiveError(e instanceof Error ? e.message : "Failed to start build");
+    } finally {
+      setBuildStarting(false);
+    }
+  }, [buildDescription, strategy]);
+
+  const openBuild = useCallback((id: string) => {
+    setBuild(null);
+    setBuildSnapshot(null);
+    setBuildId(id);
+  }, []);
 
   const pause = useCallback(() => setPlaying(false), []);
   const toggle = useCallback(() => {
@@ -351,7 +455,9 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
   const isDemo = frame?.isDemo ?? mode === "demo";
 
   const provenanceLabel =
-    mode === "live"
+    mode === "build"
+      ? `LIVE BUILD · ${strategy.toUpperCase()}`
+      : mode === "live"
       ? `LIVE BACKEND · ${strategy.toUpperCase()}`
       : isDemo
       ? "DEMO SCENARIO"
@@ -403,10 +509,17 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     selectedTaskId,
     selectTask,
     isDemo,
-    isLive: mode === "live",
+    isLive: mode === "live" || mode === "build",
     provenanceLabel,
     spawnRole,
     liveError,
+    buildDescription,
+    setBuildDescription,
+    build,
+    buildRunning,
+    buildStarting,
+    startBuild,
+    openBuild,
   };
 
   return (
