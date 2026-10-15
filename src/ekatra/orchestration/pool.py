@@ -120,6 +120,8 @@ class AdaptiveAgentPool:
         for role in _POOL_ORDER:
             counts[role] = {"total": 0, "idle": 0, "idle_spawned": 0, "active": 0}
         for agent in self._agents.values():
+            if agent.status is AgentStatus.TERMINATED:
+                continue
             role = Role(agent.role)
             info = counts.setdefault(role, {"total": 0, "idle": 0, "idle_spawned": 0, "active": 0})
             info["total"] += 1
@@ -131,7 +133,10 @@ class AdaptiveAgentPool:
                 info["active"] += 1
         return counts
 
-    def to_dicts(self) -> list[dict[str, Any]]:
+    def to_dicts(self, include_terminated: bool = False) -> list[dict[str, Any]]:
+        """Serialize agents; terminated agents are kept only on request."""
+        if include_terminated:
+            return [a.to_dict() for a in self._agents.values()]
         return [a.to_dict() for a in self.list_agents()]
 
     @classmethod

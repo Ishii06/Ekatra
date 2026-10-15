@@ -136,7 +136,6 @@ class AdaptiveController:
 
         if candidate_roles:
             best = max(candidate_roles, key=lambda r: workload_scores[r.value])
-            new_agent_id = _next_agent_id(best, all_agents)
             return _decision(
                 AdaptiveAction.SPAWN,
                 workload_scores, risk_score, risk_level, previous_state,
@@ -150,6 +149,7 @@ class AdaptiveController:
         if (
             risk_level == "HIGH"
             and sec_info.get("total", 0) < max_agents
+            and observation.role(Role.SECURITY).queue_length > 0
         ):
             return _decision(
                 AdaptiveAction.SPAWN,
@@ -327,6 +327,8 @@ def _reassign_candidate(
         if not idle_agents:
             continue
         for task in sorted(role_tasks, key=lambda t: t["id"]):
+            if not _dependencies_complete(task, tasks):
+                continue  # not runnable yet; moving it would not help
             assigned = task.get("assigned_agent")
             if assigned and role_agents.get(assigned) != "IDLE" and assigned in idle_agents:
                 continue  # assigned to an idle agent, no reassignment needed
@@ -334,6 +336,12 @@ def _reassign_candidate(
                 target = idle_agents[0]
                 return task, target
     return None
+
+
+def _dependencies_complete(task: dict[str, Any], tasks: list[dict[str, Any]]) -> bool:
+    """True when every known dependency of ``task`` is COMPLETED."""
+    status = {t["id"]: t["status"] for t in tasks}
+    return all(status.get(dep, "COMPLETED") == "COMPLETED" for dep in task.get("dependencies") or [])
 
 
 def _prioritize_candidate(

@@ -69,6 +69,11 @@ class ExperimentTask(BaseModel):
     dependencies: list[str] = Field(default_factory=list)
     initial_status: TaskStatus | None = None
     retry_count: int = Field(default=0, ge=0)
+    # Simulation inputs (used by the simulated-clock scheduler only):
+    # probability that one execution attempt fails, and how many defects /
+    # security issues a completed QA / Security task reports.
+    failure_probability: float = Field(default=0.0, ge=0.0, le=1.0)
+    defects: int = Field(default=0, ge=0)
 
     @field_validator("key")
     @classmethod

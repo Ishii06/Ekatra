@@ -49,6 +49,7 @@ class ExperimentRecord:
     adaptive_summary: dict[str, Any] = field(default_factory=dict)
     quality_observations: list[dict[str, Any]] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)
     raw_events: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -60,6 +61,7 @@ class ExperimentRecord:
         raw_events: list[dict[str, Any]],
         run_id: str | None = None,
         scenario_id: str | None = None,
+        config: dict[str, Any] | None = None,
     ) -> "ExperimentRecord":
         timing = metrics.timing
         quality = metrics.quality.get("observations") or []
@@ -81,6 +83,7 @@ class ExperimentRecord:
                 for o in quality
             ],
             metrics=metrics.to_dict(),
+            config=dict(config or {}),
             raw_events=raw_events,
         )
 
@@ -99,6 +102,7 @@ class ExperimentRecord:
             "adaptive_summary": self.adaptive_summary,
             "quality_observations": self.quality_observations,
             "metrics": self.metrics,
+            "config": self.config,
             "raw_events": self.raw_events,
         }
 

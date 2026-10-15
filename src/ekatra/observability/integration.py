@@ -183,6 +183,26 @@ def tool_executed_event(tool_call: dict[str, Any]) -> EventDict:
     )
 
 
+def quality_observation_event(
+    category: str,
+    result: str,
+    task: dict[str, Any],
+    count: int = 1,
+    timestamp: str | None = None,
+) -> EventDict:
+    """A measured quality outcome (e.g. a test pass/fail, defects found)."""
+    return _event(
+        EventType.QUALITY_OBSERVATION,
+        timestamp or task.get("completed_at"),
+        category=category,
+        result=result,
+        count=count,
+        task_id=task["id"],
+        agent_id=task.get("assigned_agent"),
+        details={"role": task.get("role")},
+    )
+
+
 def decision_events(decision: dict[str, Any]) -> list[EventDict]:
     """Turn one serialized AdaptiveDecision into its orthogonal event set.
 
@@ -328,6 +348,7 @@ __all__ = [
     "task_prioritized_event",
     "task_reassigned_event",
     "task_retried_event",
+    "quality_observation_event",
     "task_started_event",
     "tool_executed_event",
     "workflow_completed_event",
