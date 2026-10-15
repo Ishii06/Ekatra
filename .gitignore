@@ -27,3 +27,5 @@ dist/
 /data/
 /logs/
 /experiments/*/results/
+
+/projects/
