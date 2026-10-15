@@ -162,11 +162,17 @@ How it works (`src/ekatra/build/`):
   files through the permission-checked workspace tools (architect/QA/security →
   `docs/`, backend → `backend/`, frontend → `frontend/`; path traversal blocked).
   Failed attempts are retried with the previous error fed back to the model.
-* **validate** – QA's evidence is static: Python `ast` parse, imports resolve,
-  assets exist, every frontend `/api` call has a backend route, `node --check`
-  for JavaScript if Node is installed. Generated code is never executed by Ekatra.
-* **repair** – QA/Security findings and static issues become fix tasks (one round
-  by default, `--repair-rounds`).
+* **validate** – static checks: Python `ast` parse, imports resolve, assets exist,
+  every frontend `/api` call has a backend route, `node --check` for JavaScript if
+  Node is installed.
+* **smoke test** – the generated app is also *run once*: in a separate Python process
+  (project folder as working directory, API keys removed from the environment, 30 s
+  timeout) it imports `backend.main`, starts the app with FastAPI's test client and
+  requests `/` and the `/api` paths the frontend calls. **This executes generated
+  code.** Disable it with `--no-smoke-test` / `BuildConfig(smoke_test=False)`.
+* **repair** – QA/Security findings, static issues and smoke-test failures become fix
+  tasks (two rounds by default, `--repair-rounds`). Fix tasks may create missing
+  modules/assets and see the other files of their area.
 * **scheduling** – ready tasks run in parallel threads, at most
   `BuildConfig.max_concurrent_llm` Gemini requests at once. With `--strategy
   adaptive` the deterministic controller observes the real queue between
@@ -177,8 +183,8 @@ How it works (`src/ekatra/build/`):
 
 Limits: the generated site is only as good as the model (`gemini-3.5-flash-lite`
 is fast but sloppier than larger models), dead links and unfinished pages can
-remain after the repair round, and nothing is tested by actually running the
-site. Gemini rate limits (429) and overload (503) are retried with backoff.
+remain after the repair rounds, and the smoke test only exercises startup, `/` and
+simple GET routes, not every feature. Gemini rate limits (429) and overload (503) are retried with backoff.
 
 ## Backend API and Dashboard
 
@@ -200,7 +206,9 @@ Dashboard modes: **Demo** (scripted), **Experiment** (recorded M8 dataset), **Li
 (a scenario run through the mock-agent workflows) and **Build** — type a website
 description, press *Start build*, and watch the agents, spawns, tasks, controller
 decisions and generated files appear live. Click a file to read it; when the build
-finishes the panel shows validation issues and the commands to run the site.
+finishes the panel shows validation issues, the commands to run the site, and a
+**Run site** button that starts the generated backend on a free `127.0.0.1` port
+(API keys stripped from its environment) and embeds the running site in a frame.
 
 Build endpoints (`/api/builds`; one build may run at a time):
 
@@ -211,6 +219,7 @@ Build endpoints (`/api/builds`; one build may run at a time):
 | `GET /api/builds/{id}` | full state: agents, tasks, decisions, workload, risk, metrics, events, files, log, issues |
 | `GET /api/builds/{id}/stream` | Server-Sent Events: one state snapshot per change, then `event: done` |
 | `GET /api/builds/{id}/files` / `.../files/{path}` | list / read generated files (confined to `backend/`, `frontend/`, `docs/`) |
+| `POST` / `GET` / `DELETE /api/builds/{id}/launch` | run / check / stop the generated site on localhost (executes generated code; at most 3 at once) |
 
 Scenario endpoints (`/api/scenarios`, `/api/runs...`) are unchanged. Build state is kept in
 memory, so it is lost when the backend restarts (the files in `projects/` remain).
