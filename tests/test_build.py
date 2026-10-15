@@ -340,3 +340,31 @@ def test_generate_gives_up_after_retries(monkeypatch):
 def test_cli_requires_an_api_key(capsys):
     assert build_cli(["a shop"]) == 2
     assert "GEMINI_API_KEY" in capsys.readouterr().err
+
+
+# ---- weaker-model behaviour --------------------------------------------------
+
+
+def test_empty_init_file_is_accepted_and_partial_progress_is_kept(tmp_path):
+    class Sloppy(FakeLLM):
+        """Omits one deliverable on the first attempt and returns an empty __init__.py."""
+
+        def __call__(self, prompt, json_mode):
+            reply = super().__call__(prompt, json_mode)
+            if "exactly these files (and no others): backend/__init__.py, backend/main.py" in prompt:
+                data = json.loads(reply)
+                for f in data["files"]:
+                    if f["path"] == "backend/__init__.py":
+                        f["content"] = ""
+                if "previous attempt FAILED" not in prompt:
+                    data["files"] = [f for f in data["files"] if f["path"] != "backend/main.py"]
+                    self.saw_first = True
+                return json.dumps(data)
+            return reply
+
+    llm = Sloppy()
+    result = _build(tmp_path, llm, "fixed")
+    assert result.success
+    assert (result.root / "backend/__init__.py").is_file()
+    retry_prompts = [p for p in llm.calls if "previous attempt FAILED" in p]
+    assert retry_prompts and "backend/main.py" in retry_prompts[0]

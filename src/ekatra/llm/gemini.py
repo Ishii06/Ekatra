@@ -11,6 +11,7 @@ no key is configured, keeping the team runtime fully deterministic.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -71,6 +72,17 @@ _TRANSIENT_MARKERS = (
 )
 
 
+_RETRY_DELAY = re.compile(r"retry(?:Delay)?\D{0,12}(\d+(?:\.\d+)?)\s*s", re.I)
+
+
+def _retry_delay(exc: Exception, attempt: int) -> float:
+    """Seconds to wait: the server's suggested delay if given, else backoff."""
+    match = _RETRY_DELAY.search(str(exc))
+    if match:
+        return min(90.0, float(match.group(1)) + 1.0)
+    return min(60.0, 5.0 * (2**attempt))
+
+
 def _is_transient(exc: Exception) -> bool:
     text = f"{type(exc).__name__} {exc}".lower()
     return any(marker in text for marker in _TRANSIENT_MARKERS)
@@ -82,7 +94,7 @@ def generate(
     json_mode: bool = False,
     max_output_tokens: int | None = None,
     timeout_seconds: float = 180.0,
-    retries: int = 3,
+    retries: int = 5,
     model: str | None = None,
     settings: "Settings | None" = None,
     sleep: Callable[[float], None] = time.sleep,
@@ -121,7 +133,7 @@ def generate(
                 raise GeminiProviderError(_scrub(str(exc), config)) from None
             last = exc
         if attempt < retries:
-            sleep(min(30.0, 2.0 * (2**attempt)))
+            sleep(_retry_delay(last, attempt))
     raise GeminiProviderError(_scrub(f"Gemini request failed: {last}", config))
 
 
