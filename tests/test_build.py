@@ -100,7 +100,8 @@ class FakeLLM:
         return json.dumps({"files": files, "summary": f"wrote {key}"})
 
 
-def _build(tmp_path, llm, strategy="adaptive", **cfg):
+def _build(tmp_path, llm, strategy="adaptive", **cfg):  # noqa: E302
+    cfg.setdefault("smoke_test", False)  # runtime checks have their own tests
     return build_project("A tiny shop website", out_dir=tmp_path / "site", strategy=strategy,
                          llm=llm, config=BuildConfig(**cfg))
 
@@ -368,3 +369,99 @@ def test_empty_init_file_is_accepted_and_partial_progress_is_kept(tmp_path):
     assert (result.root / "backend/__init__.py").is_file()
     retry_prompts = [p for p in llm.calls if "previous attempt FAILED" in p]
     assert retry_prompts and "backend/main.py" in retry_prompts[0]
+
+
+# ---- repair can create missing files -----------------------------------------
+
+
+class MissingModuleLLM(FakeLLM):
+    """backend/main.py imports backend.models, which no planned task creates."""
+
+    def __call__(self, prompt, json_mode):
+        reply = super().__call__(prompt, json_mode)
+        if "exactly these files (and no others)" in prompt and "backend/main.py" in prompt.split("\n\nYou must")[0] + prompt:
+            data = json.loads(reply)
+            for f in data["files"]:
+                if f["path"] == "backend/main.py" and "backend.models" not in f["content"]:
+                    f["content"] += "\nfrom backend.models import X\n"
+            return json.dumps(data)
+        return reply
+
+
+def test_validator_names_the_file_that_would_fix_a_missing_import_or_asset(tmp_path):
+    _write(tmp_path, {
+        "backend/main.py": MAIN_PY + "\nfrom backend.models import X\n",
+        "frontend/index.html": '<script src="app.js"></script><link href="css/site.css">',
+    })
+    hints = {i["missing_file"] for i in validate_project(tmp_path) if "missing_file" in i}
+    assert hints == {"backend/models.py", "frontend/app.js", "frontend/css/site.css"}
+
+
+def test_repair_round_creates_a_missing_module(tmp_path):
+    result = _build(tmp_path, MissingModuleLLM(), "fixed", repair_rounds=1)
+    assert (result.root / "backend/models.py").is_file()
+    assert result.final_issues == [] and result.success
+
+
+def test_without_repair_a_missing_module_is_reported_as_high(tmp_path):
+    result = _build(tmp_path, MissingModuleLLM(), "fixed", repair_rounds=0)
+    assert any(i["severity"] == "high" and i.get("missing_file") == "backend/models.py"
+               for i in result.final_issues)
+    assert not result.success
+
+
+# ---- runtime smoke test --------------------------------------------------------
+
+from ekatra.build.smoke import smoke_test  # noqa: E402
+
+
+def test_smoke_test_passes_for_a_healthy_site(tmp_path):
+    _write(tmp_path, {"backend/main.py": MAIN_PY, "backend/__init__.py": "",
+                      "frontend/index.html": INDEX_HTML, "frontend/app.js": APP_JS})
+    assert smoke_test(tmp_path) == []
+
+
+def test_smoke_test_reports_a_crash_at_import_and_blames_the_file(tmp_path):
+    _write(tmp_path, {"backend/main.py": MAIN_PY + "\nfrom backend import helper\n",
+                      "backend/__init__.py": "",
+                      "backend/helper.py": "import backend.does_not_exist\n",
+                      "frontend/index.html": INDEX_HTML})
+    issues = smoke_test(tmp_path)
+    assert issues and issues[0]["severity"] == "high"
+    assert "failed to import or start" in issues[0]["description"]
+    assert issues[0]["file"].startswith("backend/")
+
+
+def test_smoke_test_reports_a_server_error_on_an_api_route(tmp_path):
+    broken = MAIN_PY.replace("return []", "raise RuntimeError('boom')")
+    _write(tmp_path, {"backend/main.py": broken, "backend/__init__.py": "",
+                      "frontend/index.html": INDEX_HTML, "frontend/app.js": APP_JS})
+    assert any("GET /api/items returned HTTP 500" in i["description"] for i in smoke_test(tmp_path))
+
+
+def test_smoke_test_does_not_pass_secrets_to_generated_code(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-secret")
+    probe = MAIN_PY + "\nimport os\nLEAK = os.environ.get('GEMINI_API_KEY')\nassert LEAK is None, 'secret leaked'\n"
+    _write(tmp_path, {"backend/main.py": probe, "backend/__init__.py": "",
+                      "frontend/index.html": INDEX_HTML})
+    assert smoke_test(tmp_path) == []
+
+
+def test_smoke_failure_triggers_repair_and_can_be_disabled(tmp_path):
+    class RuntimeBroken(FakeLLM):
+        def __call__(self, prompt, json_mode):
+            reply = super().__call__(prompt, json_mode)
+            if "backend/main.py" in prompt and "FIX task" not in prompt and "exactly these files" in prompt:
+                data = json.loads(reply)
+                for f in data["files"]:
+                    if f["path"] == "backend/main.py":
+                        f["content"] = f["content"].replace("return []", "raise RuntimeError('boom')")
+                return json.dumps(data)
+            return reply
+
+    repaired = _build(tmp_path, RuntimeBroken(), "fixed", repair_rounds=1, smoke_test=True)
+    assert repaired.final_issues == [] and repaired.success
+
+    unchecked = build_project("A tiny shop website", out_dir=tmp_path / "nosmoke", strategy="fixed",
+                              llm=RuntimeBroken(), config=BuildConfig(repair_rounds=0, smoke_test=False))
+    assert unchecked.final_issues == []  # static analysis alone cannot see the runtime error

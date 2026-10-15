@@ -22,8 +22,11 @@ DESCRIPTION = "A tiny shop website with a product list"
 def _isolated_builds(tmp_path, monkeypatch):
     builds.BUILDS.clear()
     monkeypatch.setattr(builds, "PROJECTS_DIR", tmp_path)
+    monkeypatch.setattr(builds, "SMOKE_TEST", False)
     monkeypatch.setattr(builds, "_make_llm", lambda: FakeLLM(delay=0.01))
     yield
+    for build_id in list(builds.SITES):
+        builds._stop_site(build_id)
     deadline = time.time() + 20
     while any(b["status"] == "running" for b in builds.BUILDS.values()) and time.time() < deadline:
         time.sleep(0.05)
@@ -165,3 +168,50 @@ def test_workload_summary_uses_real_scores_not_constants():
     assert workload["score"] > 60 and workload["level"] in ("ELEVATED", "HIGH")
     assert workload["complexity"] != 0.42 and 0 < workload["complexity"] <= 1
     assert 0 <= risk["score"] <= 100
+
+
+# ---- running the generated site ----------------------------------------------
+
+
+def test_generated_site_can_be_launched_served_and_stopped():
+    import urllib.request
+
+    build_id = _start()
+    _wait(build_id)
+    assert client.get(f"/api/builds/{build_id}/launch").json() == {"running": False, "url": None}
+
+    launched = client.post(f"/api/builds/{build_id}/launch")
+    assert launched.status_code == 200, launched.text
+    url = launched.json()["url"]
+    assert launched.json()["running"] and url.startswith("http://127.0.0.1:")
+    assert client.post(f"/api/builds/{build_id}/launch").json()["url"] == url  # idempotent
+
+    page = urllib.request.urlopen(url, timeout=5).read().decode()
+    assert "<script" in page                                              # the generated frontend
+    assert json.loads(urllib.request.urlopen(url + "api/items", timeout=5).read()) == []  # its backend
+
+    stopped = client.delete(f"/api/builds/{build_id}/launch").json()
+    assert stopped == {"running": False, "url": None}
+    with pytest.raises(Exception):
+        urllib.request.urlopen(url, timeout=1)
+
+
+def test_launch_is_refused_while_building_or_without_a_backend(tmp_path):
+    slow = FakeLLM(delay=0.3)
+    builds._make_llm = lambda: slow
+    build_id = _start()
+    assert client.post(f"/api/builds/{build_id}/launch").status_code == 409
+    _wait(build_id)
+
+    builds.BUILDS[build_id]["out_dir"] = tmp_path / "empty"
+    assert client.post(f"/api/builds/{build_id}/launch").status_code == 400
+    assert client.post("/api/builds/nope/launch").status_code == 404
+
+
+def test_launched_site_does_not_inherit_secrets(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-secret")
+    monkeypatch.setenv("SOME_TOKEN", "t")
+    monkeypatch.setenv("PYTHONPATH", "src")
+    env = builds._site_env()
+    assert "GEMINI_API_KEY" not in env and "SOME_TOKEN" not in env and "PYTHONPATH" not in env
+    assert "PATH" in env or "Path" in env

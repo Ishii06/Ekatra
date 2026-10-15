@@ -51,7 +51,7 @@ async function failure(res: Response, fallback: string): Promise<Error> {
 export async function startBuild(
   description: string,
   strategy: "fixed" | "adaptive",
-  repairRounds = 1,
+  repairRounds = 2,
 ): Promise<RunResponse> {
   const res = await fetch(`${API_URL}/api/builds`, {
     method: "POST",
@@ -120,4 +120,28 @@ export function followBuild(
     finished = true;
     source.close();
   };
+}
+
+export interface SiteStatus {
+  running: boolean;
+  url: string | null;
+}
+
+export async function getSiteStatus(buildId: string): Promise<SiteStatus> {
+  const res = await fetch(`${API_URL}/api/builds/${buildId}/launch`);
+  if (!res.ok) throw await failure(res, "Failed to read site status");
+  return res.json();
+}
+
+/** Starts the generated backend on a free localhost port (executes generated code). */
+export async function launchSite(buildId: string): Promise<SiteStatus> {
+  const res = await fetch(`${API_URL}/api/builds/${buildId}/launch`, { method: "POST" });
+  if (!res.ok) throw await failure(res, "Failed to start the site");
+  return res.json();
+}
+
+export async function stopSite(buildId: string): Promise<SiteStatus> {
+  const res = await fetch(`${API_URL}/api/builds/${buildId}/launch`, { method: "DELETE" });
+  if (!res.ok) throw await failure(res, "Failed to stop the site");
+  return res.json();
 }

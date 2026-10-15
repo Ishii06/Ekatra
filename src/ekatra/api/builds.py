@@ -10,10 +10,15 @@ publishes a consistent state snapshot after every change; clients read it with
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import re
+import socket
+import subprocess
+import sys
 import threading
 import time
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +31,7 @@ from pydantic import BaseModel, Field
 from ekatra.api.summary import workload_and_risk
 from ekatra.build.live import LIVE_WORKLOAD, BuildConfig, build_project
 from ekatra.build.plan import LLMFn
+from ekatra.build.smoke import scrubbed_env
 from ekatra.config.settings import get_settings
 from ekatra.observability.metrics import compute_metrics
 from ekatra.workspace import PathTraversalError, Workspace
@@ -34,6 +40,7 @@ router = APIRouter()
 
 PROJECTS_DIR = Path(__file__).resolve().parents[3] / "projects"
 BUILDS: dict[str, dict[str, Any]] = {}
+SMOKE_TEST = True  # run the generated app during the build; tests switch it off
 _LOCK = threading.Lock()
 
 _SHOWN_DIRS = {"backend", "frontend", "docs"}
@@ -45,7 +52,7 @@ _LOG_TAIL = 400
 class BuildCreateRequest(BaseModel):
     description: str = Field(..., min_length=10, max_length=600)
     strategy: str = Field("adaptive", pattern="^(fixed|adaptive)$")
-    repair_rounds: int = Field(1, ge=0, le=2)
+    repair_rounds: int = Field(2, ge=0, le=3)
 
 
 def _make_llm() -> LLMFn | None:
@@ -79,7 +86,7 @@ def _run_build(build_id: str) -> None:
             out_dir=entry["out_dir"],
             strategy=entry["strategy"],
             llm=_make_llm(),
-            config=BuildConfig(repair_rounds=entry["repair_rounds"]),
+            config=BuildConfig(repair_rounds=entry["repair_rounds"], smoke_test=SMOKE_TEST),
             progress=progress,
             on_update=on_update,
         )
@@ -240,4 +247,101 @@ def read_build_file(build_id: str, path: str) -> dict[str, Any]:
     }
 
 
-__all__ = ["BUILDS", "PROJECTS_DIR", "router"]
+# -- running a generated site -------------------------------------------------
+#
+# Launching executes the generated backend, so it only ever happens when a client
+# explicitly asks, on 127.0.0.1, with API keys stripped from the environment.
+
+SITES: dict[str, subprocess.Popen] = {}
+SITE_URLS: dict[str, str] = {}
+_MAX_SITES = 3
+
+
+def _site_env() -> dict[str, str]:
+    return scrubbed_env()  # no API keys, and the site must not import Ekatra
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _site_running(build_id: str) -> bool:
+    proc = SITES.get(build_id)
+    return proc is not None and proc.poll() is None
+
+
+def _stop_site(build_id: str) -> None:
+    proc = SITES.pop(build_id, None)
+    SITE_URLS.pop(build_id, None)
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@atexit.register
+def _stop_all_sites() -> None:
+    for build_id in list(SITES):
+        _stop_site(build_id)
+
+
+def _site_status(build_id: str) -> dict[str, Any]:
+    running = _site_running(build_id)
+    return {"running": running, "url": SITE_URLS.get(build_id) if running else None}
+
+
+@router.get("/builds/{build_id}/launch")
+def site_status(build_id: str) -> dict[str, Any]:
+    _get(build_id)
+    return _site_status(build_id)
+
+
+@router.post("/builds/{build_id}/launch")
+def launch_site(build_id: str) -> dict[str, Any]:
+    entry = _get(build_id)
+    if entry["status"] == "running":
+        raise HTTPException(status_code=409, detail="The build is still running")
+    out_dir = Path(entry["out_dir"])
+    if not (out_dir / "backend" / "main.py").is_file():
+        raise HTTPException(status_code=400, detail="The build has no backend/main.py to run")
+    if _site_running(build_id):
+        return _site_status(build_id)
+    if sum(1 for b in SITES if _site_running(b)) >= _MAX_SITES:
+        raise HTTPException(status_code=409, detail="Too many sites are running; stop one first")
+
+    port = _free_port()
+    log_path = out_dir / "ekatra-site.log"
+    with open(log_path, "w", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "backend.main:app", "--host", "127.0.0.1", "--port", str(port)],
+            cwd=out_dir, env=_site_env(), stdout=log, stderr=subprocess.STDOUT,
+        )
+    url = f"http://127.0.0.1:{port}/"
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        try:
+            urllib.request.urlopen(url, timeout=1).close()
+            SITES[build_id], SITE_URLS[build_id] = proc, url
+            return _site_status(build_id)
+        except Exception:  # noqa: BLE001 - not ready yet
+            time.sleep(0.3)
+    if proc.poll() is None:
+        proc.kill()
+    tail = log_path.read_text(encoding="utf-8", errors="replace")[-600:].strip()
+    raise HTTPException(status_code=500, detail=f"The site did not start: {tail or 'no output'}")
+
+
+@router.delete("/builds/{build_id}/launch")
+def stop_site(build_id: str) -> dict[str, Any]:
+    _get(build_id)
+    _stop_site(build_id)
+    return _site_status(build_id)
+
+
+__all__ = ["BUILDS", "PROJECTS_DIR", "SITES", "router"]

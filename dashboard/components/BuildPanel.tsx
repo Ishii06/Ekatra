@@ -8,13 +8,23 @@ import {
   FileCode2,
   FileText,
   Hammer,
+  ExternalLink,
+  Globe,
   Loader2,
   Rocket,
+  Square,
   ScrollText,
   X,
 } from "lucide-react";
 import { useDashboard } from "@/lib/dashboard-context";
-import { getBuildFile, type BuildFile, type BuildIssue } from "@/lib/api/builds";
+import {
+  getBuildFile,
+  getSiteStatus,
+  launchSite,
+  stopSite,
+  type BuildFile,
+  type BuildIssue,
+} from "@/lib/api/builds";
 import { cn } from "@/lib/cn";
 import { Chip, Panel } from "./ui";
 
@@ -174,6 +184,106 @@ function IssueList({ issues }: { issues: BuildIssue[] }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+
+function SitePreview({ buildId }: { buildId: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  /* Re-attach to a site that is already running for this build. */
+  useEffect(() => {
+    let cancelled = false;
+    getSiteStatus(buildId)
+      .then((s) => {
+        if (!cancelled) setUrl(s.url);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [buildId]);
+
+  async function run() {
+    setBusy(true);
+    setError(null);
+    try {
+      setUrl((await launchSite(buildId)).url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not start the site");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stop() {
+    setBusy(true);
+    try {
+      await stopSite(buildId);
+      setUrl(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not stop the site");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Panel
+      eyebrow="Result"
+      title="Final website"
+      icon={<Globe className="h-4 w-4" />}
+      subtitle="Runs the generated backend on your machine (localhost only) and shows the site it serves. This executes the generated code, so it starts only when you press Run."
+      actions={url ? <Chip tone="mint">RUNNING</Chip> : <Chip tone="neutral">STOPPED</Chip>}
+      bodyClassName="p-4"
+    >
+      <div className="flex flex-wrap items-center gap-3">
+        {url ? (
+          <>
+            <a
+              href={url}
+              target="_blank"
+              rel="noreferrer"
+              className="mono inline-flex items-center gap-2 rounded-lg border border-accent/50 bg-accent/15 px-3 py-2 text-[11px] uppercase tracking-[0.14em] text-accent hover:bg-accent/25"
+            >
+              <ExternalLink className="h-3.5 w-3.5" /> Open in new tab
+            </a>
+            <button
+              onClick={stop}
+              disabled={busy}
+              className="mono inline-flex items-center gap-2 rounded-lg border border-rose/40 bg-rose/10 px-3 py-2 text-[11px] uppercase tracking-[0.14em] text-rose hover:bg-rose/15 disabled:opacity-50"
+            >
+              <Square className="h-3.5 w-3.5" /> Stop site
+            </button>
+            <span className="mono text-[10px] text-fg-dim">{url}</span>
+          </>
+        ) : (
+          <button
+            onClick={run}
+            disabled={busy}
+            className="mono inline-flex items-center gap-2 rounded-lg border border-accent/50 bg-accent/15 px-4 py-2 text-[11px] uppercase tracking-[0.14em] text-accent hover:bg-accent/25 disabled:opacity-50"
+          >
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Rocket className="h-3.5 w-3.5" />}
+            {busy ? "Starting…" : "Run site"}
+          </button>
+        )}
+      </div>
+      {error && (
+        <pre className="scroll-thin mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg border border-rose/40 bg-rose/10 p-3 text-[11px] text-rose">
+          {error}
+        </pre>
+      )}
+      {url && (
+        <iframe
+          key={url}
+          src={url}
+          title="Generated website"
+          className="mt-4 h-[560px] w-full rounded-xl border border-line-soft bg-white"
+        />
+      )}
+    </Panel>
   );
 }
 
@@ -337,6 +447,10 @@ export function BuildPanel() {
             </div>
           </Panel>
         </div>
+      )}
+
+      {finished && build.status === "completed" && build.files.some((f) => f.path === "backend/main.py") && (
+        <SitePreview key={build.run_id} buildId={build.run_id} />
       )}
     </div>
   );
