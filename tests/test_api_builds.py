@@ -78,6 +78,8 @@ def test_state_is_published_while_the_build_runs():
 
 
 def test_sse_stream_pushes_updates_then_done():
+    # Slow the fake model so progress spans several 0.4 s polls (updates are coalesced).
+    builds._make_llm = lambda: FakeLLM(delay=0.25)  # the fixture restores the original
     build_id = _start()
     updates, done = [], False
     with client.stream("GET", f"/api/builds/{build_id}/stream") as response:
