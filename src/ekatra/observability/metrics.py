@@ -143,8 +143,9 @@ def _task_waits(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def compute_task_metrics(
     tasks: list[dict[str, Any]],
     timing: dict[str, Any],
+    events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Task totals, completion/waiting durations, and queue series."""
+    """Task totals, completion/waiting durations, reliability, and queue series."""
     completed = [t for t in tasks if t.get("status") == "COMPLETED"]
     failed = [t for t in tasks if t.get("status") == "FAILED"]
     retried = [t for t in tasks if (t.get("retry_count") or 0) > 0]
@@ -160,8 +161,14 @@ def compute_task_metrics(
     waiting_total = sum(w["waiting_seconds"] for w in waits)
     average_waiting = waiting_total / len(waits) if waits else 0.0
 
+    failure_events = sum(
+        1 for e in events or [] if e.get("type") == EventType.TASK_FAILED.value
+    )
+
     return {
         "total_tasks": len(tasks),
+        "task_success_rate": round(len(completed) / len(tasks), 6) if tasks else 0.0,
+        "task_failure_events": failure_events,
         "completed_tasks": len(completed),
         "failed_tasks": len(failed),
         "retried_tasks": len(retried),
@@ -391,13 +398,37 @@ def compute_tool_metrics(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def compute_quality_metrics(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Quality outcomes recorded as ``quality_observation`` events.
+
+    Only recorded observations are aggregated (no invented scores):
+
+    * ``test_pass_rate``        - passed / (passed + failed) ``tests`` attempts
+    * ``defects_detected``      - sum of ``defects_detected`` counts (QA)
+    * ``security_issues_identified`` - sum of security-review counts
+    """
     observations = [
         e for e in events if e.get("type") == EventType.QUALITY_OBSERVATION.value
     ]
     by_category = Counter(o.get("category") for o in observations)
     by_result = Counter(o.get("result") for o in observations)
+
+    def total(category: str) -> int:
+        return sum(
+            int(o.get("count") or 0) for o in observations if o.get("category") == category
+        )
+
+    passed = sum(
+        1 for o in observations if o.get("category") == "tests" and o.get("result") == "pass"
+    )
+    failed = sum(
+        1 for o in observations if o.get("category") == "tests" and o.get("result") == "fail"
+    )
     return {
         "quality_observation_count": len(observations),
+        "test_attempts": passed + failed,
+        "test_pass_rate": round(passed / (passed + failed), 6) if passed + failed else None,
+        "defects_detected": total("defects_detected"),
+        "security_issues_identified": total("security_issues_identified"),
         "observations": observations,
         "counts_by_category": dict(by_category),
         "counts_by_result": dict(by_result),
@@ -454,7 +485,7 @@ def compute_metrics(
     """
     events = events if events is not None else state.get("observability_events") or []
     timing = compute_timing(events)
-    task = compute_task_metrics(state.get("tasks") or [], timing)
+    task = compute_task_metrics(state.get("tasks") or [], timing, events)
     agent = compute_agent_metrics(
         state.get("agents") or [], state.get("tasks") or [], events, timing
     )

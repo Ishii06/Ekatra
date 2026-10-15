@@ -7,6 +7,7 @@ API key is present.
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -29,7 +30,7 @@ class Settings(BaseSettings):
     llm_provider: str = "gemini"
 
     # Gemini credentials (ADR-006). Empty string means no LLM calls are made.
-    gemini_api_key: str = ""
+    gemini_api_key: str = Field(default="", repr=False)
 
     # Gemini model configuration (remains runtime-configurable for experiments).
     gemini_model: str = "gemini-3.5-flash"

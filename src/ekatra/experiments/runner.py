@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from ekatra.experiments.scenarios import ExperimentScenario
+from ekatra.experiments.simulation import SimConfig, simulate
 from ekatra.graph import run
 from ekatra.graph.adaptive import run_adaptive
 from ekatra.observability.experiment import ExperimentRecord
@@ -50,7 +51,17 @@ def build_initial_state(scenario: ExperimentScenario) -> EkatraState:
     return state
 
 
-def _run_once(scenario: ExperimentScenario, strategy: str) -> EkatraState:
+def _run_once(
+    scenario: ExperimentScenario,
+    strategy: str,
+    engine: str = "simulated",
+    repetition: int = 0,
+    sim: SimConfig | None = None,
+) -> EkatraState:
+    if engine == "simulated":
+        return simulate(scenario, strategy, repetition=repetition, sim=sim)
+    if engine != "graph":
+        raise ValueError(f"unknown engine {engine!r}; expected 'simulated' or 'graph'")
     state = build_initial_state(scenario)
     if strategy == "fixed":
         return run(state)
@@ -60,11 +71,40 @@ def _run_once(scenario: ExperimentScenario, strategy: str) -> EkatraState:
     raise ValueError(f"unknown strategy {strategy!r}; expected 'fixed' or 'adaptive'")
 
 
+def _run_config(
+    scenario: ExperimentScenario,
+    strategy: str,
+    repetition: int,
+    engine: str,
+    sim: SimConfig | None,
+) -> dict[str, Any]:
+    """Everything needed to reproduce a run (never contains secrets)."""
+    from ekatra.config.settings import get_settings
+    from ekatra.orchestration.controller import ControllerConfig
+
+    controller = ControllerConfig()
+    settings = get_settings()
+    return {
+        "engine": engine,
+        "strategy": strategy,
+        "repetition": repetition,
+        "scenario_id": scenario.scenario_id,
+        "scenario_timing": dict(scenario.timing or {}),
+        "simulation": (sim or SimConfig()).to_dict() if engine == "simulated" else None,
+        "workload": controller.workload.model_dump(),
+        "risk": controller.risk.model_dump(),
+        "max_agents_per_role": controller.max_agents_per_role,
+        "model": {"provider": settings.llm_provider, "name": settings.gemini_model},
+    }
+
+
 def run_scenario(
     scenario: ExperimentScenario,
     strategy: str = "fixed",
     repetitions: int = 1,
     run_ids: list[str] | None = None,
+    engine: str = "simulated",
+    sim: SimConfig | None = None,
 ) -> list[ExperimentRecord]:
     """Run a scenario under a strategy one or more times.
 
@@ -74,6 +114,10 @@ def run_scenario(
         repetitions: How many independent runs to execute.
         run_ids: Optional explicit run ids (one per repetition); defaults to
             deterministic ``"{scenario_id}-{strategy}-{n}"`` ids.
+        engine: ``"simulated"`` (default) runs on the virtual clock of
+            :mod:`ekatra.experiments.simulation`; ``"graph"`` runs the
+            LangGraph workflows (instant mock execution, wall-clock times).
+        sim: Simulation parameters (``engine="simulated"`` only).
 
     Returns:
         One M7 experiment record per repetition.
@@ -86,7 +130,7 @@ def run_scenario(
     records: list[ExperimentRecord] = []
     for n in range(repetitions):
         run_id = run_ids[n] if run_ids else f"{scenario.scenario_id}-{strategy}-{n + 1}"
-        final_state = _run_once(scenario, strategy)
+        final_state = _run_once(scenario, strategy, engine, n, sim)
         metrics = compute_metrics(final_state)
         raw_events = final_state.get("observability_events", [])
         records.append(
@@ -97,6 +141,7 @@ def run_scenario(
                 raw_events=raw_events,
                 run_id=run_id,
                 scenario_id=scenario.scenario_id,
+                config=_run_config(scenario, strategy, n, engine, sim),
             )
         )
     return records
@@ -105,6 +150,8 @@ def run_scenario(
 def run_comparison(
     scenario: ExperimentScenario,
     repetitions: int = 1,
+    engine: str = "simulated",
+    sim: SimConfig | None = None,
 ) -> dict[str, Any]:
     """Run a scenario under both strategies and group the records by strategy.
 
@@ -117,14 +164,22 @@ def run_comparison(
         raise ValueError("repetitions must be a positive integer")
     return {
         "scenario": scenario.to_dict(),
-        "fixed": [r.to_dict() for r in run_scenario(scenario, "fixed", repetitions)],
-        "adaptive": [r.to_dict() for r in run_scenario(scenario, "adaptive", repetitions)],
+        "fixed": [
+            r.to_dict()
+            for r in run_scenario(scenario, "fixed", repetitions, engine=engine, sim=sim)
+        ],
+        "adaptive": [
+            r.to_dict()
+            for r in run_scenario(scenario, "adaptive", repetitions, engine=engine, sim=sim)
+        ],
     }
 
 
 def run_all_scenarios(
     scenarios: list[ExperimentScenario] | None = None,
     repetitions: int = 1,
+    engine: str = "simulated",
+    sim: SimConfig | None = None,
 ) -> dict[str, Any]:
     """Run every scenario under both strategies and return a dataset.
 
@@ -139,10 +194,11 @@ def run_all_scenarios(
     selected = scenarios if scenarios is not None else all_scenarios()
     return {
         "dataset": "ekatra_m8_scenario_dataset",
-        "version": 1,
+        "version": 2,
+        "engine": engine,
         "repetitions": repetitions,
         "scenarios": {
-            scenario.scenario_id: run_comparison(scenario, repetitions)
+            scenario.scenario_id: run_comparison(scenario, repetitions, engine, sim)
             for scenario in selected
         },
     }

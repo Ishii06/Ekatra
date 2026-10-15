@@ -12,6 +12,7 @@ import { Timeline } from "./Timeline";
 import { MetricsPanel } from "./MetricsPanel";
 import { FixedVsAdaptive } from "./FixedVsAdaptive";
 import { AgentDetailPanel } from "./AgentDetailPanel";
+import { BuildPanel } from "./BuildPanel";
 import { SectionHeader } from "./ui";
 
 function Background() {
@@ -27,7 +28,7 @@ function Background() {
 }
 
 function Footer() {
-  const { isDemo, provenanceLabel, scenario } = useDashboard();
+  const { isDemo, mode, provenanceLabel, scenario } = useDashboard();
   return (
     <footer className="mx-auto max-w-[1600px] px-6 pb-12 pt-6">
       <div className="glass rounded-2xl px-5 py-4">
@@ -36,13 +37,17 @@ function Footer() {
             Ekatra · Research prototype dashboard · Not a production deployment
           </div>
           <div className="mono text-[9px] uppercase tracking-[0.16em] text-fg-dim">
-            {provenanceLabel} · {scenario.name}
+            {provenanceLabel} · {mode === "build" ? "Gemini build" : scenario.name}
           </div>
         </div>
         <p className="mt-2 text-[11px] leading-relaxed text-fg-dim">
-          {isDemo
-            ? "This view is a simulated presentation walkthrough using deterministic fixture data. It is clearly separated from recorded experiment runs and must not be presented as an experimental result."
-            : "This view replays recorded Milestone 8 experiment events. No values are recomputed in the frontend; orchestration, workload and risk scoring remain in the Python engine."}
+          {mode === "build"
+            ? "This view streams a real build from the Python backend: Gemini writes the files, the deterministic controller allocates agents. Nothing is recomputed in the frontend."
+            : mode === "live"
+              ? "This view runs a scenario through the Python backend's mock-agent workflows. Nothing is recomputed in the frontend."
+              : isDemo
+                ? "This view is a simulated presentation walkthrough using deterministic fixture data. It is clearly separated from recorded experiment runs and must not be presented as an experimental result."
+                : "This view replays recorded Milestone 8 experiment events. No values are recomputed in the frontend; orchestration, workload and risk scoring remain in the Python engine."}
         </p>
       </div>
     </footer>
@@ -50,6 +55,7 @@ function Footer() {
 }
 
 function DashboardBody() {
+  const { mode } = useDashboard();
   return (
     <div className="relative min-h-screen">
       <Background />
@@ -58,7 +64,7 @@ function DashboardBody() {
         <Hero />
 
         <div className="mx-auto max-w-[1600px] space-y-8 px-6 pb-4 pt-6">
-          <PlayerControls />
+          {mode === "build" ? <BuildPanel /> : <PlayerControls />}
 
           <section>
             <SectionHeader

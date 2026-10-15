@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from ekatra.agents.base import Role
 from ekatra.tasks.task import Task, TaskStatus
@@ -57,9 +57,11 @@ class TaskManager:
     it, keeping the shared ``EkatraState["tasks"]`` list authoritative.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, now_fn: Callable[[], datetime] | None = None) -> None:
         self._tasks: dict[str, Task] = {}
         self._next_number = 1
+        # Injectable clock (a simulated clock in experiments, wall clock otherwise).
+        self._now = now_fn or (lambda: datetime.now(timezone.utc))
 
     # -- construction ------------------------------------------------------
 
@@ -88,9 +90,13 @@ class TaskManager:
         return task
 
     @classmethod
-    def from_dicts(cls, task_dicts: list[dict[str, Any]]) -> "TaskManager":
+    def from_dicts(
+        cls,
+        task_dicts: list[dict[str, Any]],
+        now_fn: Callable[[], datetime] | None = None,
+    ) -> "TaskManager":
         """Rebuild a manager from state task dicts."""
-        manager = cls()
+        manager = cls(now_fn=now_fn)
         manager._tasks = {t["id"]: Task.from_dict(t) for t in task_dicts}
         numbers = (_ID_PATTERN.match(tid) for tid in manager._tasks)
         existing = [int(m.group(1)) for m in numbers if m]
@@ -174,7 +180,7 @@ class TaskManager:
             )
         task.assigned_agent = agent_id
         if task.assigned_at is None:
-            task.assigned_at = datetime.now(timezone.utc)
+            task.assigned_at = self._now()
         if task.status is TaskStatus.PENDING:
             task.status = TaskStatus.ASSIGNED
         return task
@@ -192,7 +198,7 @@ class TaskManager:
             )
         self.validate_dependencies(task)
         task.status = TaskStatus.RUNNING
-        task.started_at = datetime.now(timezone.utc)
+        task.started_at = self._now()
         return task
 
     def complete(self, task_id: str, output: str | None = None) -> Task:
@@ -205,7 +211,7 @@ class TaskManager:
         task.status = TaskStatus.COMPLETED
         task.output = output
         if task.completed_at is None:
-            task.completed_at = datetime.now(timezone.utc)
+            task.completed_at = self._now()
         return task
 
     def fail(self, task_id: str, reason: str | None = None) -> Task:

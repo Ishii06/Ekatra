@@ -242,7 +242,7 @@ class TestRunScenario:
         assert len(data["raw_events"]) == data["metrics"]["timing"]["event_count"]
 
     def test_adaptive_run_produces_complete_record(self):
-        record = run_scenario(low_workload(), "adaptive", 1)[0]
+        record = run_scenario(low_workload(), "adaptive", 1, engine="graph")[0]
         data = record.to_dict()
         assert data["strategy"] == "adaptive"
         assert data["run_id"] == "m8_low_workload-adaptive-1"
@@ -311,7 +311,7 @@ class TestStrategyBehaviour:
             assert metrics["agent"]["dynamically_spawned_agents"] == 0
 
     def test_low_workload_adaptive_continues_only(self):
-        record = run_scenario(low_workload(), "adaptive", 1)[0]
+        record = run_scenario(low_workload(), "adaptive", 1, engine="graph")[0]
         decisions = record.to_dict()["metrics"]["adaptive"]["decisions_by_type"]
         assert decisions == {"CONTINUE": 1}
 
@@ -366,7 +366,7 @@ class TestStrategyBehaviour:
     def test_fixed_completes_expected_backlog_for_each_scenario(self):
         for scenario in all_scenarios():
             expected = scenario.expected_characteristics["fixed_completed_tasks"]
-            record = run_scenario(scenario, "fixed", 1)[0]
+            record = run_scenario(scenario, "fixed", 1, engine="graph")[0]
             completed = record.to_dict()["metrics"]["task"]["completed_tasks"]
             assert completed == expected, scenario.scenario_id
 
@@ -575,17 +575,17 @@ class TestAdaptiveMaxRoundsBoundary:
 
     def test_max_one_allows_exactly_one_cycle(self, adaptive_rounds):
         adaptive_rounds(1)
-        events = run_scenario(security_risk(), "adaptive", 1)[0].raw_events
+        events = run_scenario(security_risk(), "adaptive", 1, engine="graph")[0].raw_events
         assert _adaptive_cycles(events) == [1]
 
     def test_max_two_allows_exactly_two_cycles(self, adaptive_rounds):
         adaptive_rounds(2)
-        events = run_scenario(security_risk(), "adaptive", 1)[0].raw_events
+        events = run_scenario(security_risk(), "adaptive", 1, engine="graph")[0].raw_events
         assert _adaptive_cycles(events) == [1, 2]
 
     def test_termination_at_configured_max(self, adaptive_rounds):
         adaptive_rounds(3)
-        events = run_scenario(security_risk(), "adaptive", 1)[0].raw_events
+        events = run_scenario(security_risk(), "adaptive", 1, engine="graph")[0].raw_events
         assert _adaptive_cycles(events) == [1, 2, 3]
 
     def test_max_eight_runs_eight_not_seven_with_no_hidden_extra(

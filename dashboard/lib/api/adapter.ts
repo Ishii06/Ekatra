@@ -63,21 +63,37 @@ export function convertRunStateToSnapshot(
   runState: RunStateResponse,
   scenarioName: string,
 ): OrgSnapshot {
-  const agents: Agent[] = (runState.agents || []).map((a: any) => ({
-    agentId: a.agent_id || a.agentId,
-    role: a.role as RoleKey,
-    status: a.status,
-    currentTask: a.current_task || a.currentTask || null,
-    spawned: isSpawnedId(a.agent_id || a.agentId),
-    meta: {
-      tasksCompleted: 0,
-      tasksFailed: 0,
-      createdAt: new Date().toISOString(),
-      workload: runState.workload?.score ?? 0,
-      risk: runState.risk?.score ?? 0,
-    },
-    lifecycle: a.lifecycle || [a.status],
-  }));
+  const completedBy: Record<string, number> = {};
+  for (const t of runState.tasks || []) {
+    const id = t.assigned_agent || t.assignedAgent;
+    if (t.status === "COMPLETED" && id) completedBy[id] = (completedBy[id] ?? 0) + 1;
+  }
+  const failedBy: Record<string, number> = {};
+  const spawnedAt: Record<string, string> = {};
+  for (const e of runState.observability_events || []) {
+    if (e.type === "task_failed" && e.agent_id)
+      failedBy[e.agent_id] = (failedBy[e.agent_id] ?? 0) + 1;
+    if (e.type === "agent_spawned" && e.agent_id) spawnedAt[e.agent_id] = e.timestamp;
+  }
+
+  const agents: Agent[] = (runState.agents || []).map((a: any) => {
+    const id = a.agent_id || a.agentId;
+    return {
+      agentId: id,
+      role: a.role as RoleKey,
+      status: a.status,
+      currentTask: a.current_task || a.currentTask || null,
+      spawned: isSpawnedId(id),
+      meta: {
+        tasksCompleted: completedBy[id] ?? 0,
+        tasksFailed: failedBy[id] ?? 0,
+        createdAt: spawnedAt[id] ?? new Date().toISOString(),
+        workload: runState.workload?.score ?? 0,
+        risk: runState.risk?.score ?? 0,
+      },
+      lifecycle: a.lifecycle || [a.status],
+    };
+  });
 
   const tasks: Task[] = (runState.tasks || []).map((t: any) => ({
     id: t.id,
@@ -185,9 +201,9 @@ export function convertRunStateToSnapshot(
       tasks.filter((t) =>
         ["PENDING", "ASSIGNED", "RUNNING", "RETRY"].includes(t.status),
       ).length,
-    complexity: workloadObj.complexity ?? 0.42,
-    executionDelay: workloadObj.executionDelay ?? 0.3,
-    failureRate: workloadObj.failureRate ?? 0.12,
+    complexity: workloadObj.complexity ?? 0,
+    executionDelay: workloadObj.executionDelay ?? 0,
+    failureRate: workloadObj.failureRate ?? 0,
     score: workloadObj.score ?? 0,
     level: workloadObj.level ?? "NORMAL",
   };
@@ -228,7 +244,11 @@ export function convertRunStateToSnapshot(
     activeAgentId: runningTasks[0]?.assignedAgent || null,
     isDemo: false,
     title:
-      runState.status === "completed" ? "Workflow completed" : "Live execution",
+      runState.status === "completed"
+        ? "Workflow completed"
+        : runState.status === "failed"
+          ? "Run failed"
+          : "Live execution",
     narrative: latestDecision
       ? latestDecision.reason
       : "Ekatra running live via the FastAPI backend.",

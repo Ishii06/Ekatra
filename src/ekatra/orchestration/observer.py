@@ -9,7 +9,8 @@ Derivation assumptions (documented):
 
 * queue length per role: number of the role's tasks that are not COMPLETED or
   CANCELLED (the remaining work of that role)
-* complexity per role: average ``complexity`` over the role's tasks
+* complexity per role: average ``complexity`` over the role's outstanding
+  (not COMPLETED/CANCELLED) tasks, so the score falls as work drains
 * execution delay per role: fraction of the role's tasks that required a retry
   (the deterministic proxy available in the mock environment)
 * failure rate per role: fraction of the role's tasks that are FAILED or RETRY
@@ -106,7 +107,12 @@ def _role_observation(
     failed_count = sum(1 for t in role_tasks if t["status"] in _FAILED_STATES)
     retry_count = sum(t.get("retry_count", 0) for t in role_tasks)
     count = len(role_tasks) or 1
-    avg_complexity = float(sum(t.get("complexity", 1) for t in role_tasks)) / count
+    outstanding = [t for t in role_tasks if t["status"] not in _TERMINAL]
+    avg_complexity = (
+        float(sum(t.get("complexity", 1) for t in outstanding)) / len(outstanding)
+        if outstanding
+        else 0.0
+    )
 
     total_agents = len(role_agents)
     active_agents = sum(1 for a in role_agents if a["status"] == "ACTIVE")

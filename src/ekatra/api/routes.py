@@ -18,9 +18,7 @@ from ekatra.graph import build_graph as build_fixed_graph
 from ekatra.graph.adaptive import build_adaptive_graph
 from ekatra.observability.experiment import ExperimentRecord, new_run_id
 from ekatra.observability.metrics import compute_metrics
-from ekatra.orchestration import observe
-from ekatra.orchestration.workload import WorkloadCalculator, WorkloadConfig
-from ekatra.orchestration.risk import RiskCalculator, RiskConfig
+from ekatra.api.summary import workload_and_risk
 
 router = APIRouter()
 
@@ -145,38 +143,7 @@ def get_run(run_id: str) -> RunStateResponse:
     communication = state.get("communication", [])
     project_state = state.get("project_state", "PLANNING")
 
-    # Current workload and risk, derived live from the engine's observation
-    # helpers (same formulas the adaptive controller uses).
-    observation = observe(tasks, agents)
-    workload_calc = WorkloadCalculator(WorkloadConfig())
-    risk_calc = RiskCalculator(RiskConfig())
-
-    role_scores = [workload_calc.score_for(observation.role(r)) for r in observation.roles.values()]
-    max_w = max(role_scores) if role_scores else 0.0
-    r_score = risk_calc.score(observation.indicators)
-
-    queue_len = len([t for t in tasks if t.get("status") in ("PENDING", "ASSIGNED", "RUNNING", "RETRY")])
-    indicators = observation.indicators
-
-    workload_summary = {
-        "score": round(max_w, 2),
-        "level": workload_calc.level(max_w),
-        "queueLength": queue_len,
-        "complexity": 0.42,
-        "executionDelay": 0.3,
-        "failureRate": 0.12,
-    }
-
-    risk_summary = {
-        "score": round(r_score, 2),
-        "level": risk_calc.level(r_score),
-        "securityFindings": indicators.security_findings,
-        "authIssues": indicators.auth_issues,
-        "suspiciousCode": indicators.suspicious_code,
-        "failedChecks": indicators.failed_security_checks,
-        "repeatedFailures": indicators.task_failures,
-        "highRiskTasks": indicators.high_risk_tasks,
-    }
+    workload_summary, risk_summary = workload_and_risk(state)
 
     record = run_entry.get("record")
     metrics = record.metrics if record else compute_metrics(state).to_dict()

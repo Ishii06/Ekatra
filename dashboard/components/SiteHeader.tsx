@@ -1,6 +1,6 @@
 "use client";
 
-import { FlaskConical, Network, Pause, Play, Sparkles } from "lucide-react";
+import { FlaskConical, Hammer, Network, Pause, Play, Sparkles } from "lucide-react";
 import { useDashboard } from "@/lib/dashboard-context";
 import { cn } from "@/lib/cn";
 import { Chip } from "./ui";
@@ -130,6 +130,7 @@ export function SiteHeader() {
           <label className="sr-only" htmlFor="scenario-select">
             Scenario
           </label>
+          {mode !== "build" && (
           <select
             id="scenario-select"
             value={scenarioId}
@@ -143,6 +144,7 @@ export function SiteHeader() {
               </option>
             ))}
           </select>
+          )}
 
           <Segmented
             ariaLabel="Data mode"
@@ -160,10 +162,15 @@ export function SiteHeader() {
                 label: "Live Backend",
                 icon: <Network className="h-3 w-3" />,
               },
+              {
+                value: "build",
+                label: "Build",
+                icon: <Hammer className="h-3 w-3" />,
+              },
             ]}
           />
 
-          {(mode === "experiment" || mode === "live") && (
+          {(mode === "experiment" || mode === "live" || mode === "build") && (
             <Segmented
               ariaLabel="Strategy"
               value={strategy}
@@ -175,6 +182,7 @@ export function SiteHeader() {
             />
           )}
 
+          {mode !== "build" && (
           <button
             onClick={toggle}
             className={cn(
@@ -199,6 +207,7 @@ export function SiteHeader() {
               </>
             )}
           </button>
+          )}
         </div>
       </div>
     </header>
