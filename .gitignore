@@ -23,7 +23,7 @@ dist/
 .ruff_cache/
 .pytest_cache/
 
-# --- Project data and artifacts ---
-data/
-logs/
-experiments/*/results/
+# --- Project data and artifacts (repo root only) ---
+/data/
+/logs/
+/experiments/*/results/
