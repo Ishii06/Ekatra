@@ -742,7 +742,187 @@ def all_scenarios() -> list[ExperimentScenario]:
     ]
 
 
+# -- Evaluation scenarios (sprint 8/9) -----------------------------------------
+#
+# The five M8 scenarios above stress the controller's thresholds, but several of
+# them are strictly chained (each task depends on the previous one of its role),
+# so extra agents cannot shorten them. The scenarios below complete the
+# evaluation plan's workload conditions (medium, parallelisable, failure-heavy,
+# risk-heavy) and are the ones where the simulator can show adaptation helping
+# - or not. ``evaluation_scenarios()`` returns the M8 five plus these.
+
+_M9_TIMESTAMP = _M8_TIMESTAMP
+
+
+def _task(key: str, role: str, description: str, **kwargs) -> ExperimentTask:
+    return ExperimentTask(key=key, role=role, description=description, **kwargs)
+
+
+def medium_workload() -> ExperimentScenario:
+    """Ten tasks with modest parallelism: no role is overloaded."""
+    tasks = [
+        _task("architecture", "architect", "Define the system architecture and component interfaces.",
+              priority=3, complexity=3, risk=10),
+        _task("api", "backend", "Implement the public backend API.",
+              priority=3, complexity=3, risk=25, dependencies=["architecture"]),
+        _task("data", "backend", "Implement the data access layer.",
+              priority=2, complexity=3, risk=20, dependencies=["architecture"]),
+        _task("jobs", "backend", "Implement background jobs and notifications.",
+              priority=1, complexity=2, risk=15, dependencies=["architecture"]),
+        _task("web", "frontend", "Implement the main web screens.",
+              priority=2, complexity=3, risk=15, dependencies=["architecture"]),
+        _task("forms", "frontend", "Implement forms and client-side validation.",
+              priority=2, complexity=2, risk=15, dependencies=["architecture"]),
+        _task("qa_api", "qa", "Test the backend API and data layer.",
+              priority=3, complexity=2, risk=20, dependencies=["api", "data"], defects=2),
+        _task("qa_ui", "qa", "Test the web screens and forms.",
+              priority=2, complexity=2, risk=20, dependencies=["web", "forms"], defects=1),
+        _task("security_api", "security", "Review the API for common weaknesses.",
+              priority=3, complexity=2, risk=40, dependencies=["api"], defects=1),
+        _task("security_ui", "security", "Review the web client for common weaknesses.",
+              priority=2, complexity=2, risk=30, dependencies=["web"]),
+    ]
+    return ExperimentScenario(
+        scenario_id="m9_medium_workload",
+        name="Medium workload",
+        description="Ten tasks with a small amount of parallel work per role.",
+        project_description="Build a booking platform for a small clinic with a web client.",
+        timing={"seed": "ekatra-m9-medium", "base_timestamp": _M9_TIMESTAMP},
+        expected_characteristics={"task_count": len(tasks), "adaptive_workload_level": "NORMAL"},
+        tasks=tasks,
+    )
+
+
+def parallel_backlog() -> ExperimentScenario:
+    """A wide, independent backend backlog: extra backend agents can help.
+
+    Ten complex backend tasks share one upstream architecture task and do not
+    depend on each other, so spawned backend agents can take work reassigned to
+    them. The frontend backlog is smaller (unbalanced load).
+    """
+    tasks = [_task("architecture", "architect", "Define the system architecture and component interfaces.",
+                   priority=3, complexity=3, risk=10)]
+    for i in range(10):
+        tasks.append(_task(
+            f"service_{i + 1}", "backend", f"Implement backend service module {i + 1}.",
+            priority=2, complexity=4 if i % 2 else 5, risk=25,
+            dependencies=["architecture"],
+            initial_status=TaskStatus.RETRY if i in (0, 1) else None,
+            retry_count=1 if i in (0, 1) else 0,
+        ))
+    for i in range(6):
+        tasks.append(_task(
+            f"screen_{i + 1}", "frontend", f"Implement frontend screen {i + 1}.",
+            priority=2, complexity=3, risk=15, dependencies=["architecture"],
+        ))
+    services = [f"service_{i + 1}" for i in range(10)]
+    screens = [f"screen_{i + 1}" for i in range(6)]
+    tasks.append(_task("qa", "qa", "Run the regression suite across services and screens.",
+                       priority=3, complexity=3, risk=20, defects=3,
+                       dependencies=services + screens))
+    tasks.append(_task("security", "security", "Review services and screens for weaknesses.",
+                       priority=3, complexity=3, risk=40, defects=2,
+                       dependencies=services))
+    return ExperimentScenario(
+        scenario_id="m9_parallel_backlog",
+        name="Parallelisable backend backlog",
+        description="Ten independent backend tasks and six frontend tasks after one architecture task.",
+        project_description="Build a modular platform with many independent backend services.",
+        timing={"seed": "ekatra-m9-parallel", "base_timestamp": _M9_TIMESTAMP},
+        expected_characteristics={
+            "task_count": len(tasks), "backend_tasks": 10, "frontend_tasks": 6,
+            "adaptive_workload_level": "HIGH", "adaptive_spawn_role": "backend",
+        },
+        tasks=tasks,
+    )
+
+
+def failure_heavy() -> ExperimentScenario:
+    """Tasks that often fail an attempt and need retries."""
+    tasks = [_task("architecture", "architect", "Define the system architecture and component interfaces.",
+                   priority=3, complexity=3, risk=10, failure_probability=0.2)]
+    for i in range(4):
+        tasks.append(_task(f"service_{i + 1}", "backend", f"Implement backend service module {i + 1}.",
+                           priority=2, complexity=3, risk=25, dependencies=["architecture"],
+                           failure_probability=0.4))
+    for i in range(3):
+        tasks.append(_task(f"screen_{i + 1}", "frontend", f"Implement frontend screen {i + 1}.",
+                           priority=2, complexity=3, risk=15, dependencies=["architecture"],
+                           failure_probability=0.3))
+    services = [f"service_{i + 1}" for i in range(4)]
+    screens = [f"screen_{i + 1}" for i in range(3)]
+    tasks.append(_task("qa", "qa", "Run the regression suite.", priority=3, complexity=3, risk=20,
+                       failure_probability=0.35, defects=2, dependencies=services + screens))
+    tasks.append(_task("security", "security", "Review services and screens for weaknesses.",
+                       priority=3, complexity=3, risk=40, failure_probability=0.3,
+                       dependencies=services))
+    return ExperimentScenario(
+        scenario_id="m9_failure_heavy",
+        name="Failure-heavy workload",
+        description="About a third of execution attempts fail and must be retried.",
+        project_description="Build a platform on an unreliable toolchain where attempts often fail.",
+        timing={"seed": "ekatra-m9-failure", "base_timestamp": _M9_TIMESTAMP},
+        expected_characteristics={"task_count": len(tasks), "failure_injection": True},
+        tasks=tasks,
+    )
+
+
+def risk_triage() -> ExperimentScenario:
+    """Independent security reviews of mixed risk, listed lowest-risk first.
+
+    Three reviews are high risk but start at the lowest priority; the controller
+    raises them above the routine reviews so they run first.
+    """
+    tasks = [
+        _task("architecture", "architect", "Define the system architecture and component interfaces.",
+              priority=3, complexity=3, risk=10),
+        _task("backend", "backend", "Implement backend APIs including login and permission checks.",
+              priority=3, complexity=3, risk=30, dependencies=["architecture"]),
+    ]
+    for i in range(3):
+        tasks.append(_task(
+            f"routine_{i + 1}", "security",
+            f"Routine dependency review {i + 1}: vulnerability scan findings.",
+            priority=2, complexity=2, risk=30, dependencies=["backend"],
+            initial_status=TaskStatus.FAILED if i == 0 else None,
+        ))
+    for i, topic in enumerate(("authentication flow", "permission model", "credential storage")):
+        tasks.append(_task(
+            f"critical_{i + 1}", "security",
+            f"Review the {topic}: suspicious code and vulnerability findings.",
+            priority=1, complexity=3, risk=85, dependencies=["backend"], defects=2,
+            initial_status=TaskStatus.FAILED if i < 2 else None,
+        ))
+    tasks.append(_task("qa", "qa", "Validate the fixes and report defects.", priority=2,
+                       complexity=2, risk=20, defects=1, dependencies=["backend"]))
+    return ExperimentScenario(
+        scenario_id="m9_risk_triage",
+        name="Risk triage",
+        description="Six independent security reviews; three are high risk but low priority.",
+        project_description="Harden an authentication-heavy platform before launch.",
+        timing={"seed": "ekatra-m9-risk", "base_timestamp": _M9_TIMESTAMP},
+        expected_characteristics={"task_count": len(tasks), "security_tasks": 6, "high_risk_tasks": 3},
+        tasks=tasks,
+    )
+
+
+def evaluation_scenarios() -> list[ExperimentScenario]:
+    """The scenario set used for the final fixed-vs-adaptive evaluation."""
+    return [
+        *all_scenarios(),
+        medium_workload(),
+        parallel_backlog(),
+        failure_heavy(),
+        risk_triage(),
+    ]
+
+
 __all__ = [
+    "evaluation_scenarios",
+    "failure_heavy",
+    "medium_workload",
+    "parallel_backlog",
+    "risk_triage",
     "all_scenarios",
     "high_backend_workload",
     "high_frontend_workload",

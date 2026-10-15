@@ -12,6 +12,11 @@ statistical analysis is performed.
 """
 
 from ekatra.experiments.fixtures import (
+    evaluation_scenarios,
+    failure_heavy,
+    medium_workload,
+    parallel_backlog,
+    risk_triage,
     high_backend_workload,
     high_frontend_workload,
     low_workload,
@@ -26,6 +31,11 @@ from ekatra.experiments.runner import (
 from ekatra.experiments.scenarios import ExperimentScenario, ExperimentTask
 
 __all__ = [
+    "evaluation_scenarios",
+    "failure_heavy",
+    "medium_workload",
+    "parallel_backlog",
+    "risk_triage",
     "ExperimentScenario",
     "ExperimentTask",
     "high_backend_workload",

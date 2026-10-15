@@ -164,7 +164,9 @@ class AdaptiveController:
             role_info = ac.get(role, {})
             if role_info.get("idle_spawned", 0) > 0 and role_info.get("total", 0) > _baseline_count(role):
                 ws = workload_scores.get(role.value, 0.0)
-                if ws < self.config.workload.continue_below:
+                # Security capacity spawned for high risk stays while risk is HIGH.
+                held_for_risk = role is Role.SECURITY and risk_level == "HIGH"
+                if ws < self.config.workload.continue_below and not held_for_risk:
                     term_id = _idle_spawned_id(role, all_agents)
                     return _decision(
                         AdaptiveAction.TERMINATE,
