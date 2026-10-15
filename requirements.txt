@@ -4,7 +4,6 @@
 langgraph==1.2.11
 
 # LLM integration via Google Gemini (ADR-006)
-langchain-core==1.6.3
 google-genai==2.24.0
 
 # Configuration and validation
@@ -12,5 +11,15 @@ pydantic==2.13.0
 pydantic-settings==2.15.0
 python-dotenv==1.2.2
 
+# REST API adapter / dashboard backend
+fastapi==0.143.1
+uvicorn[standard]==0.54.0
+
 # Testing
 pytest==8.4.2
+
+# Analysis and graphs
+matplotlib==3.10.8
+
+# API test client
+httpx==0.28.1
