@@ -180,7 +180,7 @@ def test_generated_site_can_be_launched_served_and_stopped():
 
     build_id = _start()
     _wait(build_id)
-    assert client.get(f"/api/builds/{build_id}/launch").json() == {"running": False, "url": None}
+    assert client.get(f"/api/builds/{build_id}/launch").json() == {"running": False, "url": None, "docs_url": None}
 
     launched = client.post(f"/api/builds/{build_id}/launch")
     assert launched.status_code == 200, launched.text
@@ -193,7 +193,7 @@ def test_generated_site_can_be_launched_served_and_stopped():
     assert json.loads(urllib.request.urlopen(url + "api/items", timeout=5).read()) == []  # its backend
 
     stopped = client.delete(f"/api/builds/{build_id}/launch").json()
-    assert stopped == {"running": False, "url": None}
+    assert stopped == {"running": False, "url": None, "docs_url": None}
     with pytest.raises(Exception):
         urllib.request.urlopen(url, timeout=1)
 
@@ -217,3 +217,99 @@ def test_launched_site_does_not_inherit_secrets(monkeypatch):
     env = builds._site_env()
     assert "GEMINI_API_KEY" not in env and "SOME_TOKEN" not in env and "PYTHONPATH" not in env
     assert "PATH" in env or "Path" in env
+
+
+# ---- project types -----------------------------------------------------------
+
+from tests.test_profiles import ProfileLLM  # noqa: E402
+
+
+def _start_type(key, **extra):
+    builds._make_llm = lambda: ProfileLLM(key)  # the autouse fixture restores the original
+    response = client.post("/api/builds", json={
+        "description": f"A {key} project to try out", "strategy": "fixed", "project_type": key, **extra})
+    assert response.status_code == 200, response.text
+    return response.json()["run_id"]
+
+
+def test_profiles_are_listed_for_the_dashboard():
+    profiles = client.get("/api/build-profiles").json()
+    assert {p["key"] for p in profiles} == {"web", "api", "cli", "library", "data", "database", "game", "automation"}
+    assert all(p["label"] and p["example"] and "runnable" in p for p in profiles)
+    assert next(p for p in profiles if p["key"] == "api")["runnable"] == "api"
+    assert next(p for p in profiles if p["key"] == "cli")["runnable"] == ""
+
+
+def test_unknown_project_type_is_rejected():
+    response = client.post("/api/builds", json={"description": DESCRIPTION, "project_type": "mobile"})
+    assert response.status_code == 422
+
+
+def test_a_command_line_project_is_built_and_described_in_the_state():
+    data = _wait(_start_type("cli"))
+    assert data["status"] == "completed" and data["success"] is True
+    assert data["project_type"] == "cli" and data["project_label"] == "Command-line tool"
+    assert data["has_tests"] is True and data["runnable"] == "" and data["package"] == "app"
+    paths = {f["path"]: f["area"] for f in data["files"]}
+    assert paths["app/cli.py"] == "source" and paths["tests/test_cli.py"] == "tests"
+    assert paths["README.md"] == "project" and paths["docs/architecture.md"] == "docs"
+    assert not any("__pycache__" in p or p.endswith(".pyc") for p in paths)
+
+
+def test_any_generated_file_can_be_read_but_bookkeeping_files_cannot():
+    build_id = _start_type("cli")
+    _wait(build_id)
+    body = client.get(f"/api/builds/{build_id}/files/app/cli.py").json()
+    assert "argparse" in body["content"]
+    assert client.get(f"/api/builds/{build_id}/files/tests/test_cli.py").status_code == 200
+    assert client.get(f"/api/builds/{build_id}/files/ekatra-run.json").status_code == 404
+
+
+def test_the_projects_own_tests_can_be_run_from_the_api():
+    build_id = _start_type("cli")
+    _wait(build_id)
+    result = client.post(f"/api/builds/{build_id}/tests").json()
+    assert result["ok"] is True and result["exit_code"] == 0 and "passed" in result["output"]
+
+
+def test_the_demo_command_can_be_run_from_the_api():
+    build_id = _start_type("game")
+    _wait(build_id)
+    result = client.post(f"/api/builds/{build_id}/demo").json()
+    assert result["ok"] is True and result["results"][0]["command"].startswith("python -m app")
+
+
+def test_tests_and_demo_are_refused_when_they_do_not_apply():
+    web = _start()
+    _wait(web)
+    assert client.post(f"/api/builds/{web}/tests").status_code == 400
+    assert client.post(f"/api/builds/{web}/demo").status_code == 400
+    service = _start_type("api")
+    _wait(service)
+    assert client.post(f"/api/builds/{service}/demo").status_code == 400  # a server: use Run site, not a demo
+    assert client.post(f"/api/builds/{service}/tests").json()["ok"] is True
+    library = _start_type("library")
+    _wait(library)
+    assert client.post(f"/api/builds/{library}/demo").json()["ok"] is True  # the import check
+    assert client.post("/api/builds/nope/tests").status_code == 404
+
+
+def test_only_servers_can_be_launched():
+    build_id = _start_type("cli")
+    _wait(build_id)
+    response = client.post(f"/api/builds/{build_id}/launch")
+    assert response.status_code == 400 and "no server" in response.json()["detail"]
+
+
+def test_an_api_project_can_be_launched_and_exposes_its_docs():
+    import urllib.request
+
+    build_id = _start_type("api")
+    _wait(build_id)
+    launched = client.post(f"/api/builds/{build_id}/launch")
+    assert launched.status_code == 200, launched.text
+    info = launched.json()
+    assert info["docs_url"] == info["url"] + "docs"
+    assert json.loads(urllib.request.urlopen(info["url"] + "api/items", timeout=5).read()) == []
+    assert b"swagger" in urllib.request.urlopen(info["docs_url"], timeout=5).read().lower()
+    assert client.delete(f"/api/builds/{build_id}/launch").json()["running"] is False

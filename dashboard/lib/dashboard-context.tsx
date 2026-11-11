@@ -36,7 +36,9 @@ import {
   followBuild,
   getBuild,
   listBuilds,
+  listProfiles,
   startBuild as apiStartBuild,
+  type BuildProfile,
   type BuildStateResponse,
 } from "./api/builds";
 
@@ -92,6 +94,9 @@ interface DashboardValue {
   /* real build (Gemini-driven) */
   buildDescription: string;
   setBuildDescription: (text: string) => void;
+  profiles: BuildProfile[];
+  projectType: string;
+  setProjectType: (key: string) => void;
   build: BuildStateResponse | null;
   buildRunning: boolean;
   buildStarting: boolean;
@@ -134,6 +139,8 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
 
   /* Real build state, fed by the backend's SSE stream. */
   const [buildDescription, setBuildDescription] = useState(DEFAULT_BUILD_DESCRIPTION);
+  const [profiles, setProfiles] = useState<BuildProfile[]>([]);
+  const [projectType, setProjectTypeState] = useState("web");
   const [buildId, setBuildId] = useState<string | null>(null);
   const [build, setBuild] = useState<BuildStateResponse | null>(null);
   const [buildSnapshot, setBuildSnapshot] = useState<OrgSnapshot | null>(null);
@@ -197,10 +204,11 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     if (mode !== "build") return;
     let cancelled = false;
     getHealth()
-      .then(() => listBuilds())
-      .then((list) => {
+      .then(() => Promise.all([listBuilds(), listProfiles()]))
+      .then(([list, types]) => {
         if (cancelled) return;
         setLiveError(null);
+        setProfiles(types);
         if (!buildId && list.length > 0) setBuildId(list[0].run_id);
       })
       .catch((e: unknown) => {
@@ -377,7 +385,7 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     setBuildStarting(true);
     setLiveError(null);
     try {
-      const started = await apiStartBuild(text, strategy);
+      const started = await apiStartBuild(text, strategy, 2, projectType);
       setBuild(null);
       setBuildSnapshot(null);
       setBuildId(started.run_id);
@@ -386,7 +394,20 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setBuildStarting(false);
     }
-  }, [buildDescription, strategy]);
+  }, [buildDescription, strategy, projectType]);
+
+  /* Switching type swaps in that type's example unless the user wrote their own text. */
+  const setProjectType = useCallback(
+    (key: string) => {
+      const examples = new Set([DEFAULT_BUILD_DESCRIPTION, ...profiles.map((p) => p.example)]);
+      const next = profiles.find((p) => p.key === key);
+      setProjectTypeState(key);
+      setBuildDescription((current) =>
+        next && (current.trim() === "" || examples.has(current)) ? next.example : current,
+      );
+    },
+    [profiles],
+  );
 
   const openBuild = useCallback((id: string) => {
     setBuild(null);
@@ -515,6 +536,9 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     liveError,
     buildDescription,
     setBuildDescription,
+    profiles,
+    projectType,
+    setProjectType,
     build,
     buildRunning,
     buildStarting,

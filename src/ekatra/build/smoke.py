@@ -55,6 +55,7 @@ def scrubbed_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not any(w in k.upper() for w in _SECRET_WORDS)}
     env.pop("PYTHONPATH", None)
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"  # keep __pycache__ out of generated projects
     return env
 
 

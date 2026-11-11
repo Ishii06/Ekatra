@@ -129,7 +129,7 @@ export function MetricsPanel() {
           <span className="mono text-[9px] uppercase tracking-[0.14em] text-fg-dim">
             Scenario
           </span>
-          <span className="text-[11px] text-fg-muted">{scenario.name}</span>
+          <span className="text-[11px] text-fg-muted">{mode === "build" ? "Real build" : scenario.name}</span>
         </div>
         {m.decisionsByType && Object.keys(m.decisionsByType).length > 0 && (
           <div className="flex flex-wrap gap-1.5">

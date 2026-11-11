@@ -5,7 +5,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 export interface BuildFile {
   path: string;
   bytes: number;
-  area: "backend" | "frontend" | "docs" | "project";
+  area: "backend" | "frontend" | "docs" | "tests" | "data" | "source" | "project";
   modified_at: string;
 }
 
@@ -27,6 +27,27 @@ export interface BuildStateResponse extends RunStateResponse {
   log: string[];
   final_issues: BuildIssue[];
   out_dir: string;
+  project_type: string;
+  project_label: string;
+  /** "web" or "api" when the result can be served; "" otherwise. */
+  runnable: "web" | "api" | "";
+  has_tests: boolean;
+  package: string;
+}
+
+export interface BuildProfile {
+  key: string;
+  label: string;
+  summary: string;
+  example: string;
+  runnable: string;
+}
+
+export interface CommandResult {
+  command: string;
+  exit_code: number | null;
+  ok: boolean;
+  output: string;
 }
 
 export interface BuildSummary {
@@ -52,11 +73,17 @@ export async function startBuild(
   description: string,
   strategy: "fixed" | "adaptive",
   repairRounds = 2,
+  projectType = "web",
 ): Promise<RunResponse> {
   const res = await fetch(`${API_URL}/api/builds`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ description, strategy, repair_rounds: repairRounds }),
+    body: JSON.stringify({
+      description,
+      strategy,
+      repair_rounds: repairRounds,
+      project_type: projectType,
+    }),
   });
   if (!res.ok) throw await failure(res, "Failed to start build");
   return res.json();
@@ -125,6 +152,8 @@ export function followBuild(
 export interface SiteStatus {
   running: boolean;
   url: string | null;
+  /** API projects: the interactive documentation page. */
+  docs_url?: string | null;
 }
 
 export async function getSiteStatus(buildId: string): Promise<SiteStatus> {
@@ -143,5 +172,27 @@ export async function launchSite(buildId: string): Promise<SiteStatus> {
 export async function stopSite(buildId: string): Promise<SiteStatus> {
   const res = await fetch(`${API_URL}/api/builds/${buildId}/launch`, { method: "DELETE" });
   if (!res.ok) throw await failure(res, "Failed to stop the site");
+  return res.json();
+}
+
+export async function listProfiles(): Promise<BuildProfile[]> {
+  const res = await fetch(`${API_URL}/api/build-profiles`);
+  if (!res.ok) throw await failure(res, "Failed to load project types");
+  return res.json();
+}
+
+/** Runs the generated project's own pytest suite (executes generated code). */
+export async function runTests(buildId: string): Promise<CommandResult> {
+  const res = await fetch(`${API_URL}/api/builds/${buildId}/tests`, { method: "POST" });
+  if (!res.ok) throw await failure(res, "Failed to run the tests");
+  return res.json();
+}
+
+/** Runs the generated project's demo commands (executes generated code). */
+export async function runDemo(
+  buildId: string,
+): Promise<{ ok: boolean; results: CommandResult[] }> {
+  const res = await fetch(`${API_URL}/api/builds/${buildId}/demo`, { method: "POST" });
+  if (!res.ok) throw await failure(res, "Failed to run the demo");
   return res.json();
 }

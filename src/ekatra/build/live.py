@@ -27,8 +27,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ekatra.agents.base import AgentStatus, Role
-from ekatra.build.execute import TaskOutcome, execute_task
-from ekatra.build.plan import LLMFn, PlannedTask, plan_project
+from ekatra.build.execute import TaskOutcome, execute_task, is_visible
+from ekatra.build import pychecks
+from ekatra.build.plan import LLMFn, PlannedTask, plan_project_full
+from ekatra.build.profiles import WEB, Profile, get_profile
 from ekatra.build.smoke import smoke_test
 from ekatra.build.validate import Issue, validate_project
 from ekatra.experiments.simulation import SimConfig, _Simulation
@@ -49,6 +51,7 @@ from ekatra.orchestration.controller import AdaptiveController, ControllerConfig
 from ekatra.orchestration.pool import _BASELINE_IDS, AdaptiveAgentPool
 from ekatra.orchestration.workload import WorkloadConfig
 from ekatra.tasks.manager import TaskManager
+from ekatra.tools.registry import ALLOWED_TOOLS, RoleToolPolicy
 from ekatra.workspace import Workspace
 
 Progress = Callable[[str], None]
@@ -119,10 +122,14 @@ class _LiveBuild(_Simulation):
         cfg: BuildConfig,
         progress: Progress,
         on_update: Update | None = None,
+        profile: Profile = WEB,
+        package: str = "",
     ) -> None:
         if strategy not in ("fixed", "adaptive"):
             raise ValueError(f"unknown strategy {strategy!r}; expected 'fixed' or 'adaptive'")
         self.description = description
+        self.profile = profile
+        self.package = package
         self.strategy = strategy
         self.workspace = workspace
         self.llm = llm
@@ -188,18 +195,25 @@ class _LiveBuild(_Simulation):
         agent.status = AgentStatus.ACTIVE
         agent.current_task = task_id
         if agent.workspace is None:
-            agent.attach_workspace(self.workspace)
+            role = agent.role.value
+            agent.attach_workspace(
+                self.workspace,
+                RoleToolPolicy(role, set(ALLOWED_TOOLS[role]), self.profile.prefixes_for(role, self.package)),
+            )
         self.events.append(task_started_event(self._task(task_id)))
         planned = self.planned[task_id]
         deps = [d for key in planned.dependencies for d in self.planned[self.key_to_id[key]].deliverables]
         if planned.key.startswith("fix_"):  # fixers need to see the rest of their area
-            prefix = planned.role + "/"
-            deps += [p for p in self.workspace.list_files(".") if p.startswith(prefix) and p.endswith((".py", ".js", ".html", ".css"))]
+            prefixes = self.profile.prefixes_for(planned.role, self.package)
+            deps += [p for p in self.workspace.list_files(".")
+                     if p.startswith(prefixes) and p.endswith((".py", ".js", ".html", ".css", ".csv"))
+                     and "__pycache__" not in p]
         future = self.executor.submit(
             execute_task, agent, task_id, planned,
             workspace=self.workspace, description=self.description, llm=self.llm,
             fix_issues=self.fix_issues.get(task_id), dependency_paths=deps + planned.deliverables,
             previous_error=self.errors.get(task_id, ""),
+            profile=self.profile, package=self.package, evidence_fn=self.check_project,
         )
         self.futures[future] = (task_id, agent.agent_id)
         self.log(f"  [{self.clock.t:6.1f}s] {agent.agent_id:<11} started   {planned.key}")
@@ -268,17 +282,18 @@ class _LiveBuild(_Simulation):
         found = self.review_issues + self.check_project()
         issues = [i for i in found if i["severity"] in ("high", "medium")]
         created = False
-        for owner in ("backend", "frontend"):
+        for owner in self.profile.fixable_roles:
             mine = [i for i in issues if i["owner"] == owner]
+            prefixes = self.profile.prefixes_for(owner, self.package)
             wanted = {i["file"] for i in mine
-                      if i["file"].startswith(owner + "/") and self.workspace.exists(i["file"])}
+                      if i["file"].startswith(prefixes) and self.workspace.exists(i["file"])}
             wanted |= {i["missing_file"] for i in mine
-                       if i.get("missing_file", "").startswith(owner + "/")}
+                       if i.get("missing_file", "").startswith(prefixes)}
             files = sorted(wanted)[:8]
             if not mine:
                 continue
             if not files:
-                files = ["backend/main.py"] if owner == "backend" else ["frontend/index.html"]
+                files = [self.profile.fix_default(owner, self.package) or prefixes[0] + "main.py"]
             key = f"fix_{owner}_{round_no}"
             task = self.manager.create(
                 role=Role(owner), description=f"Fix review findings in {', '.join(files)}",
@@ -297,13 +312,22 @@ class _LiveBuild(_Simulation):
             self.publish()
         return created
 
+    def owners(self) -> dict[str, str]:
+        """File -> role that owns it, from the plan's deliverables."""
+        return {path: pt.role for pt in self.planned.values() for path in pt.deliverables}
+
     def check_project(self) -> list[Issue]:
-        """Static validation plus (optionally) the runtime smoke test."""
-        issues = validate_project(self.workspace.root)
+        """Static validation plus (optionally) the runtime checks of the project type."""
+        root = self.workspace.root
+        if self.profile.kind == "python":
+            if self.cfg.smoke_test:
+                self.log("  running the project's checks and tests...")
+            return pychecks.check(root, self.package, self.profile, self.owners(), runtime=self.cfg.smoke_test)
+        issues = validate_project(root)
         if self.cfg.smoke_test and not any(i["severity"] == "high" and i["file"] == "backend/main.py"
                                            and "missing" in i["description"] for i in issues):
             self.log("  smoke-testing the generated app...")
-            issues += smoke_test(self.workspace.root)
+            issues += smoke_test(root)
         return issues
 
     # -- finish ------------------------------------------------------------------
@@ -339,6 +363,8 @@ class _LiveBuild(_Simulation):
             "observability_events": self.events,
             "plan_source": self.plan_source,
             "final_issues": self.final_issues,
+            "project_type": self.profile.key,
+            "package": self.package,
         }
 
 
@@ -351,13 +377,12 @@ Built by Ekatra ({strategy} orchestration) from this description:
 ## Run it
 
 ```bash
-python -m venv .venv
-.venv\\Scripts\\activate        # Windows (use `source .venv/bin/activate` elsewhere)
-pip install -r requirements.txt
-uvicorn backend.main:app --reload
+{run_text}
 ```
 
-Then open http://127.0.0.1:8000
+## Tests
+
+{tests_text}
 
 ## Files
 
@@ -377,8 +402,14 @@ def build_project(
     config: BuildConfig | None = None,
     progress: Progress | None = None,
     on_update: Update | None = None,
+    project_type: str = "web",
 ) -> BuildResult:
-    """Build a website for ``description`` into ``out_dir`` with Gemini-driven agents."""
+    """Build software for ``description`` into ``out_dir`` with Gemini-driven agents.
+
+    ``project_type`` selects the profile: web, api, cli, library, data, database, game
+    or automation (see :mod:`ekatra.build.profiles`).
+    """
+    profile = get_profile(project_type)
     if llm is None:
         from ekatra.llm.gemini import generate
 
@@ -394,13 +425,14 @@ def build_project(
             return raw_llm(prompt, json_mode)
 
     workspace = Workspace(out_dir)
-    log(f"Planning with the Project Manager ({strategy} strategy)...")
-    plan, plan_source = plan_project(description, llm)
-    log(f"Plan ({plan_source}): {len(plan)} tasks")
+    log(f"Planning a {profile.noun} with the Project Manager ({strategy} strategy)...")
+    planned = plan_project_full(description, llm, profile)
+    plan, plan_source, package = planned.tasks, planned.source, planned.package
+    log(f"Plan ({plan_source}): {len(plan)} tasks" + (f", package `{package}`" if package else ""))
     for pt in plan:
         log(f"  - {pt.key} [{pt.role}] -> {', '.join(pt.deliverables)}")
 
-    build = _LiveBuild(description, strategy, workspace, llm, cfg, log, on_update)
+    build = _LiveBuild(description, strategy, workspace, llm, cfg, log, on_update, profile, package)
     build.plan_source = plan_source
     build.create_tasks(plan)
     with ThreadPoolExecutor(max_workers=cfg.max_workers) as executor:
@@ -414,16 +446,20 @@ def build_project(
 
     state = build._final_state()
     metrics = compute_metrics(state)
-    files = sorted(p for p in workspace.list_files(".") if p.split("/")[0] in {"backend", "frontend", "docs"})
-    workspace.write_text("requirements.txt", "fastapi\nuvicorn[standard]\n")
+    files = sorted(p for p in workspace.list_files(".") if is_visible(p))
+    workspace.write_text("requirements.txt", profile.requirements)
+    tests_text = ("`python -m pytest` (run from this folder)." if profile.kind == "python"
+                  else "The project's QA report is in `docs/qa-report.md`.")
     workspace.write_text("README.md", _README.format(
         title=description.split(".")[0][:70], strategy=strategy, description=description,
+        run_text=profile.render(profile.run_text, package), tests_text=tests_text,
         files="\n".join(f"- `{p}`" for p in files)))
     record = ExperimentRecord.from_metrics(
         strategy, description, metrics, state["observability_events"],
         run_id=f"build-{strategy}-{int(time.time())}", scenario_id="live_build",
         config={
             "engine": "live", "strategy": strategy, "plan_source": plan_source,
+            "project_type": profile.key, "package": package,
             "build": cfg.__dict__, "workload": LIVE_WORKLOAD.model_dump(),
             "max_agents_per_role": cfg.max_agents_per_role,
             "model": _model_config(),

@@ -1,37 +1,31 @@
 """Real task execution: one agent, one task, one Gemini call, real files.
 
-Developers (architect/backend/frontend) are asked for a JSON list of files and
-only the files the plan assigned to the task are written. QA and Security read
-the project, are given the static-validation evidence, and write a report and a
-structured issue list. Every read and write goes through ``Agent.use_tool`` so
-role permissions (write prefixes) and path containment are enforced and every
-call is recorded.
+Developers (architect/backend/frontend and, for python projects, QA writing tests)
+are asked for a JSON list of files and only the files the plan assigned to the task
+are written. QA and Security *reviewers* read the project, are given the check
+evidence, and write a report plus a structured issue list. Every read and write goes
+through ``Agent.use_tool`` so role permissions (write prefixes) and path containment
+are enforced and every call is recorded. What the project looks like (prompts, layout,
+checks) comes from the build's :class:`~ekatra.build.profiles.Profile`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
-from ekatra.agents.base import Agent, Role
+from ekatra.agents.base import Agent
 from ekatra.build.plan import LLMFn, PlannedTask, extract_json
+from ekatra.build.profiles import WEB, Profile
 from ekatra.build.validate import Issue, validate_project
 from ekatra.workspace import Workspace
 
 _CONTEXT_FILE_LIMIT = 9000
 _CONTEXT_TOTAL_LIMIT = 40000
 _ARCH_LIMIT = 14000
-_MAX_TOKENS = 32768
 
-_STANDARDS = """Project standards (follow exactly):
-- Backend: Python 3, FastAPI. backend/main.py defines `app`, includes routers from the other backend
-  modules, and mounts the frontend/ directory with StaticFiles(directory=..., html=True) at "/" AFTER
-  all /api routes (compute the path from Path(__file__).resolve().parent.parent / "frontend").
-  Import siblings as `from backend.<module> import ...`. Only fastapi and the standard library.
-- Frontend: static HTML, CSS and vanilla JavaScript (no build step, no external CDNs). Call the backend
-  with fetch() using the exact /api paths from docs/architecture.md. The site must look polished and be
-  responsive.
-- Write COMPLETE, working files. No placeholders, no TODOs, no "rest of the code" comments."""
+# Kept for compatibility: the web profile's standards text.
+_STANDARDS = WEB.standards
 
 
 @dataclass
@@ -62,10 +56,15 @@ def _strip_fence(content: str) -> str:
     return content if content.endswith("\n") else content + "\n"
 
 
+def is_visible(path: str) -> bool:
+    """Project files worth showing to agents and users (no caches or Ekatra bookkeeping)."""
+    parts = path.split("/")
+    return not (path.startswith("ekatra-") or "__pycache__" in parts or ".pytest_cache" in parts
+                or path.endswith(".pyc") or parts[0].startswith(".") or parts[0] == "output")
+
+
 def _project_files(workspace: Workspace) -> list[str]:
-    return sorted(
-        p for p in workspace.list_files(".") if not p.startswith("ekatra-") and p.split("/")[0] in {"backend", "frontend", "docs"}
-    )
+    return sorted(p for p in workspace.list_files(".") if is_visible(p))
 
 
 def _context(agent: Agent, task_id: str, paths: list[str]) -> str:
@@ -91,14 +90,25 @@ def _retry_note(previous_error: str) -> str:
     )
 
 
+def _is_report_task(planned: PlannedTask) -> bool:
+    """QA/Security tasks that only write one Markdown report under docs/ are reviews."""
+    return (planned.role in ("qa", "security") and len(planned.deliverables) == 1
+            and planned.deliverables[0].startswith("docs/") and planned.deliverables[0].endswith(".md"))
+
+
 def _developer_prompt(role: str, planned: PlannedTask, description: str, arch: str,
                       files_ctx: str, listing: list[str], fix_issues: list[Issue],
-                      previous_error: str = "") -> str:
+                      previous_error: str = "", profile: Profile = WEB, pkg: str = "") -> str:
     fixing = _retry_note(previous_error)
     if fix_issues:
         lines = "\n".join(f"- [{i['severity']}] {i['file']}: {i['description']}" for i in fix_issues)
         fixing += f"\nThis is a FIX task. Correct these problems by rewriting the files below:\n{lines}\n"
-    return f"""You are the {role} developer on a software team building this website:
+    if role == "qa":
+        fixing += ("\nYou write the automated tests. They must PASS against the code shown below (read it "
+                   "carefully) and verify the behaviour described in the architecture document: cover every "
+                   "public function or command, normal cases and error cases.\n")
+    title = profile.title_for(role)
+    prompt = f"""You are the {title} on a software team building this {profile.noun}:
 
 {description}
 
@@ -106,7 +116,7 @@ Your task: {planned.description}
 {fixing}
 You must write exactly these files (and no others): {', '.join(planned.deliverables)}
 
-{_STANDARDS}
+{profile.render(profile.standards, pkg)}
 
 Architecture document (docs/architecture.md):
 {arch or '(not written yet)'}
@@ -118,45 +128,38 @@ Existing files relevant to you:
 
 Return ONLY a JSON object: {{"files": [{{"path": "<one of your files>", "content": "<full file>"}}],
 "summary": "<one sentence on what you built>"}}"""
+    return prompt
 
 
-def _architect_prompt(planned: PlannedTask, description: str, previous_error: str = "") -> str:
-    return f"""You are the software architect for this website project:
+def _architect_prompt(planned: PlannedTask, description: str, previous_error: str = "",
+                      profile: Profile = WEB, pkg: str = "") -> str:
+    return f"""You are the software architect for this {profile.noun} project:
 
 {description}
 
 Your task: {planned.description}
 {_retry_note(previous_error)}
-{_STANDARDS}
+{profile.render(profile.standards, pkg)}
 
-Write docs/architecture.md in Markdown with these sections, precise enough for developers working in
-parallel who cannot talk to each other:
-1. Overview and pages (every page and what it shows)
-2. File layout: every file under backend/ and frontend/ with one line on its purpose and its public
-   functions/classes (names and signatures)
-3. REST API contract: every endpoint as `METHOD /api/path` with request JSON and response JSON examples
-4. Data model: fields and types
-5. How the frontend and backend connect (backend/main.py serves frontend/ at "/")
+{profile.render(profile.architect_body, pkg)}
 
 Return ONLY a JSON object: {{"files": [{{"path": "docs/architecture.md", "content": "<markdown>"}}],
 "summary": "<one sentence>"}}"""
 
 
 def _reviewer_prompt(role: str, planned: PlannedTask, description: str, files_ctx: str,
-                     evidence: list[Issue], previous_error: str = "") -> str:
-    focus = ("correctness: bugs, broken flows, mismatches between frontend calls and backend routes, "
-             "missing validation") if role == "qa" else (
-             "security: injection, XSS (unsafe innerHTML), missing input validation, unsafe file access, "
-             "CORS, secrets in code, error leakage")
+                     evidence: list[Issue], previous_error: str = "", profile: Profile = WEB) -> str:
+    focus = profile.qa_focus if role == "qa" else profile.security_focus
     ev = "\n".join(f"- [{i['severity']}] {i['file']}: {i['description']}" for i in evidence) or "(none)"
-    return f"""You are the {role.upper()} engineer reviewing this website project:
+    owners = "|".join(profile.fixable_roles)
+    return f"""You are the {role.upper()} engineer reviewing this {profile.noun} project:
 
 {description}
 
 Your task: {planned.description}
 {_retry_note(previous_error)}Focus on {focus}.
 
-Static analysis already found these problems (treat them as real):
+Automated checks already found these problems (treat them as real):
 {ev}
 
 Project files:
@@ -164,7 +167,7 @@ Project files:
 
 Return ONLY a JSON object:
 {{"report_markdown": "<a clear Markdown report>",
- "issues": [{{"severity": "high|medium|low", "owner": "backend|frontend", "file": "<path>",
+ "issues": [{{"severity": "high|medium|low", "owner": "{owners}", "file": "<path>",
               "description": "<specific problem and how to fix it>"}}],
  "summary": "<one sentence>"}}
 Only list real, specific issues that exist in the files above; use an empty list if there are none."""
@@ -181,29 +184,37 @@ def execute_task(
     fix_issues: list[Issue] | None = None,
     dependency_paths: list[str] | None = None,
     previous_error: str = "",
+    profile: Profile = WEB,
+    package: str = "",
+    evidence_fn: Callable[[], list[Issue]] | None = None,
 ) -> TaskOutcome:
     """Run one planned task as ``agent`` and return a structured outcome."""
     role = planned.role
+    reviewing = _is_report_task(planned)
     try:
         if role == "architect":
-            prompt = _architect_prompt(planned, description, previous_error)
-        elif role in ("qa", "security"):
-            evidence = validate_project(workspace.root) if role == "qa" else []
+            prompt = _architect_prompt(planned, description, previous_error, profile, package)
+        elif reviewing:
+            evidence: list[Issue] = []
+            if role == "qa":
+                evidence = evidence_fn() if evidence_fn else (
+                    validate_project(workspace.root) if profile.kind == "web" else [])
             paths = [p for p in _project_files(workspace) if not p.startswith("docs/") or p == "docs/architecture.md"]
-            prompt = _reviewer_prompt(role, planned, description, _context(agent, task_id, paths), evidence, previous_error)
+            prompt = _reviewer_prompt(role, planned, description, _context(agent, task_id, paths),
+                                      evidence, previous_error, profile)
         else:
             arch = _read(agent, task_id, "docs/architecture.md")[:_ARCH_LIMIT]
             prompt = _developer_prompt(
                 role, planned, description, arch,
                 _context(agent, task_id, dependency_paths or []),
-                _project_files(workspace), fix_issues or [], previous_error,
+                _project_files(workspace), fix_issues or [], previous_error, profile, package,
             )
         data = extract_json(llm(prompt, True))
         if not isinstance(data, dict):
             raise ValueError("model reply is not a JSON object")
 
-        if role in ("qa", "security"):
-            return _write_report(agent, task_id, planned, data, (evidence if role == "qa" else []))
+        if reviewing:
+            return _write_report(agent, task_id, planned, data, (evidence if role == "qa" else []), profile)
 
         written: list[str] = []
         missing: list[str] = []
@@ -228,12 +239,13 @@ def execute_task(
 
 
 def _write_report(agent: Agent, task_id: str, planned: PlannedTask, data: dict[str, Any],
-                  evidence: list[Issue]) -> TaskOutcome:
+                  evidence: list[Issue], profile: Profile = WEB) -> TaskOutcome:
     issues: list[Issue] = list(evidence)
+    fixable = profile.fixable_roles
     for raw in data.get("issues") or []:
         if not isinstance(raw, dict):
             continue
-        owner = raw.get("owner") if raw.get("owner") in ("backend", "frontend") else "backend"
+        owner = raw.get("owner") if raw.get("owner") in fixable else "backend"
         severity = raw.get("severity") if raw.get("severity") in ("high", "medium", "low") else "medium"
         issues.append({"severity": severity, "owner": owner, "file": str(raw.get("file", ""))[:120],
                        "description": str(raw.get("description", ""))[:400]})
@@ -241,7 +253,7 @@ def _write_report(agent: Agent, task_id: str, planned: PlannedTask, data: dict[s
     if not isinstance(report, str) or not report.strip():
         report = "# Report\n\n" + ("\n".join(f"- {i['file']}: {i['description']}" for i in issues) or "No issues found.")
     if evidence:
-        report += "\n\n## Static analysis\n" + "\n".join(f"- [{i['severity']}] {i['file']}: {i['description']}" for i in evidence)
+        report += "\n\n## Automated checks\n" + "\n".join(f"- [{i['severity']}] {i['file']}: {i['description']}" for i in evidence)
     path = planned.deliverables[0]
     result = agent.use_tool("write_file", task_id=task_id, path=path, content=_strip_fence(report))
     if not result.success:
@@ -250,4 +262,4 @@ def _write_report(agent: Agent, task_id: str, planned: PlannedTask, data: dict[s
                        issues=issues, files=[path])
 
 
-__all__ = ["TaskOutcome", "execute_task"]
+__all__ = ["TaskOutcome", "execute_task", "is_visible"]

@@ -11,6 +11,8 @@ import {
   ExternalLink,
   Globe,
   Loader2,
+  FlaskConical,
+  Play,
   Rocket,
   Square,
   ScrollText,
@@ -21,17 +23,24 @@ import {
   getBuildFile,
   getSiteStatus,
   launchSite,
+  runDemo,
+  runTests,
   stopSite,
   type BuildFile,
   type BuildIssue,
+  type BuildStateResponse,
+  type CommandResult,
 } from "@/lib/api/builds";
 import { cn } from "@/lib/cn";
 import { Chip, Panel } from "./ui";
 
-const AREA_TONE: Record<string, "accent" | "violet" | "amber" | "neutral"> = {
+const AREA_TONE: Record<string, "accent" | "violet" | "amber" | "mint" | "neutral"> = {
   backend: "accent",
   frontend: "violet",
+  source: "accent",
+  tests: "mint",
   docs: "amber",
+  data: "neutral",
   project: "neutral",
 };
 
@@ -188,17 +197,22 @@ function IssueList({ issues }: { issues: BuildIssue[] }) {
 }
 
 
-function SitePreview({ buildId }: { buildId: string }) {
-  const [url, setUrl] = useState<string | null>(null);
+function SitePreview({ build }: { build: BuildStateResponse }) {
+  const buildId = build.run_id;
+  const isApi = build.runnable === "api";
+  const [site, setSite] = useState<{ url: string; docs: string | null } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const adopt = (s: { url: string | null; docs_url?: string | null }) =>
+    setSite(s.url ? { url: s.url, docs: s.docs_url ?? null } : null);
 
   /* Re-attach to a site that is already running for this build. */
   useEffect(() => {
     let cancelled = false;
     getSiteStatus(buildId)
       .then((s) => {
-        if (!cancelled) setUrl(s.url);
+        if (!cancelled) adopt(s);
       })
       .catch(() => undefined);
     return () => {
@@ -210,7 +224,7 @@ function SitePreview({ buildId }: { buildId: string }) {
     setBusy(true);
     setError(null);
     try {
-      setUrl((await launchSite(buildId)).url);
+      adopt(await launchSite(buildId));
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not start the site");
     } finally {
@@ -222,7 +236,7 @@ function SitePreview({ buildId }: { buildId: string }) {
     setBusy(true);
     try {
       await stopSite(buildId);
-      setUrl(null);
+      setSite(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not stop the site");
     } finally {
@@ -230,34 +244,40 @@ function SitePreview({ buildId }: { buildId: string }) {
     }
   }
 
+  const shown = site ? (isApi && site.docs ? site.docs : site.url) : null;
+
   return (
     <Panel
       eyebrow="Result"
-      title="Final website"
+      title={isApi ? "Running API service" : "Final website"}
       icon={<Globe className="h-4 w-4" />}
-      subtitle="Runs the generated backend on your machine (localhost only) and shows the site it serves. This executes the generated code, so it starts only when you press Run."
-      actions={url ? <Chip tone="mint">RUNNING</Chip> : <Chip tone="neutral">STOPPED</Chip>}
+      subtitle={
+        isApi
+          ? "Starts the generated API on your machine (localhost only) and shows its interactive documentation. This executes the generated code, so it starts only when you press Run."
+          : "Runs the generated backend on your machine (localhost only) and shows the site it serves. This executes the generated code, so it starts only when you press Run."
+      }
+      actions={site ? <Chip tone="mint">RUNNING</Chip> : <Chip tone="neutral">STOPPED</Chip>}
       bodyClassName="p-4"
     >
       <div className="flex flex-wrap items-center gap-3">
-        {url ? (
+        {site && shown ? (
           <>
             <a
-              href={url}
+              href={shown}
               target="_blank"
               rel="noreferrer"
               className="mono inline-flex items-center gap-2 rounded-lg border border-accent/50 bg-accent/15 px-3 py-2 text-[11px] uppercase tracking-[0.14em] text-accent hover:bg-accent/25"
             >
-              <ExternalLink className="h-3.5 w-3.5" /> Open in new tab
+              <ExternalLink className="h-3.5 w-3.5" /> {isApi ? "Open API docs" : "Open in new tab"}
             </a>
             <button
               onClick={stop}
               disabled={busy}
               className="mono inline-flex items-center gap-2 rounded-lg border border-rose/40 bg-rose/10 px-3 py-2 text-[11px] uppercase tracking-[0.14em] text-rose hover:bg-rose/15 disabled:opacity-50"
             >
-              <Square className="h-3.5 w-3.5" /> Stop site
+              <Square className="h-3.5 w-3.5" /> {isApi ? "Stop service" : "Stop site"}
             </button>
-            <span className="mono text-[10px] text-fg-dim">{url}</span>
+            <span className="mono text-[10px] text-fg-dim">{site.url}</span>
           </>
         ) : (
           <button
@@ -266,7 +286,7 @@ function SitePreview({ buildId }: { buildId: string }) {
             className="mono inline-flex items-center gap-2 rounded-lg border border-accent/50 bg-accent/15 px-4 py-2 text-[11px] uppercase tracking-[0.14em] text-accent hover:bg-accent/25 disabled:opacity-50"
           >
             {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Rocket className="h-3.5 w-3.5" />}
-            {busy ? "Starting…" : "Run site"}
+            {busy ? "Starting…" : isApi ? "Run service" : "Run site"}
           </button>
         )}
       </div>
@@ -275,11 +295,11 @@ function SitePreview({ buildId }: { buildId: string }) {
           {error}
         </pre>
       )}
-      {url && (
+      {shown && (
         <iframe
-          key={url}
-          src={url}
-          title="Generated website"
+          key={shown}
+          src={shown}
+          title={isApi ? "Generated API documentation" : "Generated website"}
           className="mt-4 h-[560px] w-full rounded-xl border border-line-soft bg-white"
         />
       )}
@@ -287,10 +307,97 @@ function SitePreview({ buildId }: { buildId: string }) {
   );
 }
 
+function ResultBlock({ result }: { result: CommandResult }) {
+  return (
+    <div className="mt-3 overflow-hidden rounded-xl border border-line-soft bg-black/40">
+      <div className="flex items-center justify-between gap-2 border-b border-line-soft px-3 py-2">
+        <div className="mono truncate text-[11px] text-fg">{result.command}</div>
+        <Chip tone={result.ok ? "mint" : "rose"}>
+          {result.ok ? "PASSED" : result.exit_code === null ? "TIMED OUT" : `EXIT ${result.exit_code}`}
+        </Chip>
+      </div>
+      <pre className="scroll-thin max-h-[320px] overflow-auto whitespace-pre-wrap p-3 text-[11px] leading-relaxed text-fg-muted">
+        {result.output || "(no output)"}
+      </pre>
+    </div>
+  );
+}
+
+function ProjectChecks({ build }: { build: BuildStateResponse }) {
+  const buildId = build.run_id;
+  const [busy, setBusy] = useState<"tests" | "demo" | null>(null);
+  const [results, setResults] = useState<CommandResult[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  async function go(kind: "tests" | "demo") {
+    setBusy(kind);
+    setError(null);
+    try {
+      setResults(kind === "tests" ? [await runTests(buildId)] : (await runDemo(buildId)).results);
+    } catch (e) {
+      setResults([]);
+      setError(e instanceof Error ? e.message : "Could not run the command");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const button =
+    "mono inline-flex items-center gap-2 rounded-lg border border-accent/50 bg-accent/15 px-4 py-2 text-[11px] uppercase tracking-[0.14em] text-accent hover:bg-accent/25 disabled:opacity-50";
+
+  return (
+    <Panel
+      eyebrow="Result"
+      title={`Run the ${build.project_label.toLowerCase()}`}
+      icon={<FlaskConical className="h-4 w-4" />}
+      subtitle="Runs the generated project's own tests and demo command on your machine. This executes the generated code, so it starts only when you press a button."
+      bodyClassName="p-4"
+    >
+      <div className="flex flex-wrap items-center gap-3">
+        <button onClick={() => go("tests")} disabled={busy !== null} className={button}>
+          {busy === "tests" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FlaskConical className="h-3.5 w-3.5" />}
+          Run tests
+        </button>
+        <button onClick={() => go("demo")} disabled={busy !== null} className={button}>
+          {busy === "demo" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+          Run demo
+        </button>
+      </div>
+      {error && (
+        <div className="mt-3 rounded-lg border border-rose/40 bg-rose/10 px-3 py-2 text-[12px] text-rose">{error}</div>
+      )}
+      {results.map((r, i) => (
+        <ResultBlock key={`${r.command}-${i}`} result={r} />
+      ))}
+    </Panel>
+  );
+}
+
+/** The commands a person would run themselves, per project type. */
+function runInstructions(build: BuildStateResponse): string {
+  const pkg = build.package || "app";
+  const cd = `cd "${build.out_dir}"`;
+  switch (build.project_type) {
+    case "web":
+      return `${cd}\npip install -r requirements.txt\nuvicorn backend.main:app --reload`;
+    case "api":
+      return `${cd}\npip install -r requirements.txt\nuvicorn ${pkg}.main:app --reload`;
+    case "library":
+      return `${cd}\npip install -r requirements.txt\npython -m pytest`;
+    case "automation":
+      return `${cd}\npython -m ${pkg} --target <folder>          # dry run\npython -m ${pkg} --target <folder> --apply`;
+    default:
+      return `${cd}\npython -m ${pkg}${build.project_type === "cli" ? " --help" : ""}\npython -m pytest`;
+  }
+}
+
 export function BuildPanel() {
   const {
     buildDescription,
     setBuildDescription,
+    profiles,
+    projectType,
+    setProjectType,
     build,
     buildRunning,
     buildStarting,
@@ -298,6 +405,7 @@ export function BuildPanel() {
     liveError,
     strategy,
   } = useDashboard();
+  const selectedProfile = profiles.find((p) => p.key === projectType);
 
   const logRef = useRef<HTMLDivElement>(null);
   const logLength = build?.log.length ?? 0;
@@ -329,14 +437,48 @@ export function BuildPanel() {
     <div className="space-y-4">
       <Panel
         eyebrow="Real build"
-        title="Build a website with Gemini-driven agents"
+        title="Build software with Gemini-driven agents"
         icon={<Hammer className="h-4 w-4" />}
-        subtitle="Describe a site. The Project Manager plans it, agents write real files in parallel, QA and Security review it — orchestrated by the strategy selected above."
+        subtitle="Pick a project type and describe it. The Project Manager plans it, agents write real files in parallel, QA writes and runs tests, Security reviews — orchestrated by the strategy selected above."
         actions={statusChip}
         bodyClassName="p-4"
       >
+        <div className="mb-3" role="radiogroup" aria-label="Project type">
+          <div className="mono mb-1.5 text-[9px] uppercase tracking-[0.2em] text-accent/80">Project type</div>
+          <div className="flex flex-wrap gap-1.5">
+            {(profiles.length > 0 ? profiles : [{ key: "web", label: "Web app" }]).map((p) => (
+              <button
+                key={p.key}
+                role="radio"
+                aria-checked={projectType === p.key}
+                disabled={buildRunning}
+                onClick={() => setProjectType(p.key)}
+                className={cn(
+                  "mono rounded-lg border px-2.5 py-1.5 text-[10px] uppercase tracking-[0.12em] transition-colors disabled:opacity-60",
+                  projectType === p.key
+                    ? "border-accent/60 bg-accent/15 text-accent"
+                    : "border-line-soft text-fg-dim hover:border-accent/40 hover:text-fg-muted",
+                )}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+          {selectedProfile && (
+            <p className="mt-2 text-[12px] text-fg-dim">
+              {selectedProfile.summary}{" "}
+              <button
+                onClick={() => setBuildDescription(selectedProfile.example)}
+                disabled={buildRunning}
+                className="text-accent underline-offset-2 hover:underline disabled:opacity-50"
+              >
+                Use an example
+              </button>
+            </p>
+          )}
+        </div>
         <label htmlFor="build-description" className="sr-only">
-          Website description
+          Project description
         </label>
         <textarea
           id="build-description"
@@ -345,7 +487,7 @@ export function BuildPanel() {
           disabled={buildRunning}
           rows={3}
           maxLength={600}
-          placeholder="e.g. A bakery website with a menu, online ordering and an order tracker"
+          placeholder="Describe what the software should do, with a few concrete features"
           className="w-full resize-none rounded-xl border border-line-soft bg-black/30 px-3 py-2.5 text-[13px] text-fg outline-none transition-colors placeholder:text-fg-dim focus:border-accent/60 disabled:opacity-60"
         />
         <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -408,7 +550,7 @@ export function BuildPanel() {
                     Run it
                   </div>
                   <pre className="scroll-thin overflow-x-auto rounded-lg border border-line-soft bg-black/40 p-3 text-[11px] text-fg-muted">
-                    {`cd "${build.out_dir}"\npip install -r requirements.txt\nuvicorn backend.main:app --reload`}
+                    {runInstructions(build)}
                   </pre>
                 </div>
               </div>
@@ -449,8 +591,11 @@ export function BuildPanel() {
         </div>
       )}
 
-      {finished && build.status === "completed" && build.files.some((f) => f.path === "backend/main.py") && (
-        <SitePreview key={build.run_id} buildId={build.run_id} />
+      {finished && build.status === "completed" && build.runnable && (
+        <SitePreview key={build.run_id} build={build} />
+      )}
+      {finished && build.status === "completed" && build.has_tests && (
+        <ProjectChecks key={build.run_id} build={build} />
       )}
     </div>
   );
