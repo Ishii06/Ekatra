@@ -403,3 +403,58 @@ def test_web_projects_are_unchanged_by_profiles(tmp_path):
                            config=BuildConfig(smoke_test=False))
     assert result.success and result.state["project_type"] == "web"
     assert (result.root / "backend/main.py").is_file() and (result.root / "frontend/index.html").is_file()
+
+
+# ---- blame when the failure is inside the test (the real todo_cli failure) ----------
+
+SWALLOWING_CLI = (
+    "import argparse\n\n\ndef main(argv=None):\n    parser = argparse.ArgumentParser(prog='todo')\n"
+    "    try:\n        parser.parse_args(argv)\n    except SystemExit as exc:\n"
+    "        return exc.code if isinstance(exc.code, int) else 2\n    return 0\n"
+)
+HELP_TEST = (
+    "import pytest\nfrom todo_cli.cli import main\n\n\ndef test_cli_help(capsys):\n"
+    "    with pytest.raises(SystemExit) as exc_info:\n        main(['--help'])\n    assert exc_info.value.code == 0\n"
+)
+
+
+def _todo_cli_project(tmp_path, test=HELP_TEST):
+    _write(tmp_path, {
+        "todo_cli/__init__.py": "", "todo_cli/core.py": "def add(items, text):\n    return items + [text]\n",
+        "todo_cli/cli.py": SWALLOWING_CLI, "todo_cli/__main__.py": MAINS["cli"].replace("app", "todo_cli"),
+        "tests/test_cli.py": test,
+    })
+    return {"todo_cli/core.py": "backend", "todo_cli/cli.py": "frontend", "tests/test_cli.py": "qa"}
+
+
+def test_a_failure_inside_the_test_blames_the_module_it_imports_and_that_modules_owner(tmp_path):
+    owners = _todo_cli_project(tmp_path)
+    issues = pychecks.runtime_check(tmp_path, "todo_cli", get_profile("cli"), owners)
+    assert {(i["owner"], i["file"]) for i in issues} == {("frontend", "todo_cli/cli.py"), ("qa", "tests/test_cli.py")}
+    assert all("DID NOT RAISE" in i["description"] for i in issues)
+    assert not any(i["file"] == "todo_cli/core.py" for i in issues), "the test never imports core.py"
+
+
+def test_imported_modules_are_found_from_all_import_styles(tmp_path):
+    _write(tmp_path, {"todo_cli/__init__.py": "", "todo_cli/a.py": "", "todo_cli/b.py": "", "todo_cli/c/__init__.py": "x = 1\n",
+                      "tests/test_x.py": "import todo_cli.a\nfrom todo_cli.b import thing\nfrom todo_cli import c\nimport os\n"})
+    assert pychecks._imported_modules(tmp_path, "tests/test_x.py", "todo_cli") == [
+        "todo_cli/a.py", "todo_cli/b.py"]  # a package __init__ is not a blameable module
+    assert pychecks._imported_modules(tmp_path, "tests/missing.py", "todo_cli") == []
+
+
+def test_a_test_that_imports_nothing_blames_every_owned_module_not_just_backend_ones(tmp_path):
+    owners = _todo_cli_project(tmp_path, test="def test_math():\n    assert 1 == 2\n")
+    issues = pychecks.runtime_check(tmp_path, "todo_cli", get_profile("cli"), owners)
+    assert {(i["owner"], i["file"]) for i in issues} == {
+        ("backend", "todo_cli/core.py"), ("frontend", "todo_cli/cli.py"), ("qa", "tests/test_cli.py")}
+
+
+def test_the_repair_round_fixes_a_frontend_owned_module_when_the_test_fails_inside_itself(tmp_path):
+    broken = GOOD["app/cli.py"].replace("return 0", "return 1")  # main() reports failure; no exception in the code
+    llm = ProfileLLM("cli", broken={"app/cli.py": broken})
+    result = _build(tmp_path, "cli", llm=llm, repair_rounds=2)
+    fixes = [t for t in result.state["tasks"] if t["description"].startswith("Fix review findings")]
+    assert any(t["role"] == "frontend" for t in fixes), "the interface developer owns cli.py and must get a fix task"
+    assert result.final_issues == [] and result.success
+    assert "return 1" not in (result.root / "app/cli.py").read_text()

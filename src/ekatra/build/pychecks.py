@@ -226,6 +226,36 @@ def _entry_issues(root: Path, pkg: str, profile: Profile, owners: dict[str, str]
     return issues
 
 
+def _imported_modules(root: Path, test_rel: str, pkg: str) -> list[str]:
+    """Package files that a test file imports (``from pkg.x import y`` -> ``pkg/x.py``)."""
+    try:
+        tree = ast.parse((root / test_rel).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return []
+    found: list[str] = []
+
+    def add(dotted: str) -> None:
+        base = dotted.replace(".", "/")
+        for candidate in (f"{base}.py", f"{base}/__init__.py"):
+            if (root / candidate).is_file() and candidate not in found and not candidate.endswith(
+                    ("__init__.py", "__main__.py")):
+                found.append(candidate)
+                return
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith(pkg + "."):
+                    add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            if node.module.startswith(pkg + "."):
+                add(node.module)
+            elif node.module == pkg:  # from pkg import submodule
+                for alias in node.names:
+                    add(f"{pkg}.{alias.name}")
+    return found
+
+
 def _pytest_issues(root: Path, pkg: str, profile: Profile, owners: dict[str, str]) -> list[Issue]:
     argv = [sys.executable, "-m", "pytest", "-q", "-x", "--maxfail=3", "--tb=short", "-p", "no:cacheprovider", "tests"]
     code, output = _run(argv, root, timeout=PYTEST_TIMEOUT)
@@ -242,13 +272,18 @@ def _pytest_issues(root: Path, pkg: str, profile: Profile, owners: dict[str, str
     if "ModuleNotFoundError" in output or "ImportError" in output or "SyntaxError" in output:
         target = code_file or test_file or f"{pkg}/__init__.py"
         return [_issue("high", _owner(target, owners, profile), target, f"pytest could not run the tests:\n{tail}")]
-    if code_file:
-        primaries = [code_file]
-    else:  # no frame in the source: any backend module could be at fault
-        primaries = [p for p, r in owners.items() if r == "backend" and p.startswith(pkg + "/")
-                     and not p.endswith(("__init__.py", "__main__.py"))][:4] or [f"{pkg}/__init__.py"]
     test_target = test_file or next((p for p, r in owners.items() if r == "qa" and p.startswith("tests/")),
                                     f"tests/test_{pkg}.py")
+    if code_file:
+        primaries = [code_file]
+    else:
+        # The failure happened inside the test itself (a failed assertion, or an expected
+        # exception that never came). The code at fault is what the test imports - whoever
+        # owns it, including the frontend developer's interface modules.
+        primaries = _imported_modules(root, test_target, pkg)[:4]
+        if not primaries:  # the test imports nothing from the package: any owned module could be at fault
+            primaries = [p for p, r in owners.items() if r in ("backend", "frontend") and p.startswith(pkg + "/")
+                         and not p.endswith(("__init__.py", "__main__.py"))][:4] or [f"{pkg}/__init__.py"]
     for primary in primaries:
         issues.append(_issue("high", _owner(primary, owners, profile), primary,
                              "A test fails. Change the code ONLY if it violates docs/architecture.md or has a bug; "
