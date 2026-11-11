@@ -202,6 +202,20 @@ is fast but sloppier than larger models), dead links and unfinished pages can
 remain after the repair rounds, and the runtime checks exercise entry points, simple GET routes and the generated
 tests, which can themselves be weak. Gemini rate limits (429) and overload (503) are retried with backoff.
 
+### Change or fix a finished project
+
+A finished project can be modified with a text request, from the dashboard (**Change or
+fix this project** panel under the Build tab) or `POST /api/builds/{id}/changes`
+(`{"request": "Add a dark mode toggle"}`). The Project Manager reads the file list and
+`docs/architecture.md` and plans the smallest set of tasks (validated like any plan: roles,
+write locations, one owner per file). Developers rewrite only their assigned files, QA
+updates the tests, then the normal checks and repair rounds run, so a change that breaks
+something is repaired or reported instead of hidden. Leave the text empty to only re-check
+the project and repair what the checks find ("Fix remaining issues"). If a change cannot
+be planned the project is left exactly as it was and the reason is shown. Each run is saved
+as `ekatra-change-N.json` in the project folder. Projects found in `projects/` are restored
+when the backend starts, so earlier builds can be changed after a restart.
+
 ## Backend API and Dashboard
 
 ```bash

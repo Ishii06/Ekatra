@@ -27,12 +27,21 @@ export interface BuildStateResponse extends RunStateResponse {
   log: string[];
   final_issues: BuildIssue[];
   out_dir: string;
+  /** Change requests applied to this project so far, oldest first. */
+  changes: BuildChange[];
+  /** Why the latest change could not be applied (the project is unchanged). */
+  change_error: string | null;
   project_type: string;
   project_label: string;
   /** "web" or "api" when the result can be served; "" otherwise. */
   runnable: "web" | "api" | "";
   has_tests: boolean;
   package: string;
+}
+
+export interface BuildChange {
+  request: string;
+  at: number;
 }
 
 export interface BuildProfile {
@@ -195,4 +204,17 @@ export async function runDemo(
   const res = await fetch(`${API_URL}/api/builds/${buildId}/demo`, { method: "POST" });
   if (!res.ok) throw await failure(res, "Failed to run the demo");
   return res.json();
+}
+
+/**
+ * Asks the agents to change the finished project. With no text, the backend only
+ * re-checks the project and repairs the issues it finds.
+ */
+export async function requestChange(buildId: string, request?: string): Promise<void> {
+  const res = await fetch(`${API_URL}/api/builds/${buildId}/changes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request: request?.trim() ? request.trim() : null }),
+  });
+  if (!res.ok) throw await failure(res, "Failed to start the change");
 }

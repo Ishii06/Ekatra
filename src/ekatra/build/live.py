@@ -130,6 +130,8 @@ class _LiveBuild(_Simulation):
         self.description = description
         self.profile = profile
         self.package = package
+        self.known_owners: dict[str, str] = {}  # file -> role, for files from earlier runs
+        self.change_request = ""
         self.strategy = strategy
         self.workspace = workspace
         self.llm = llm
@@ -214,6 +216,7 @@ class _LiveBuild(_Simulation):
             fix_issues=self.fix_issues.get(task_id), dependency_paths=deps + planned.deliverables,
             previous_error=self.errors.get(task_id, ""),
             profile=self.profile, package=self.package, evidence_fn=self.check_project,
+            change_request=self.change_request,
         )
         self.futures[future] = (task_id, agent.agent_id)
         self.log(f"  [{self.clock.t:6.1f}s] {agent.agent_id:<11} started   {planned.key}")
@@ -314,7 +317,8 @@ class _LiveBuild(_Simulation):
 
     def owners(self) -> dict[str, str]:
         """File -> role that owns it, from the plan's deliverables."""
-        return {path: pt.role for pt in self.planned.values() for path in pt.deliverables}
+        owned = {path: pt.role for pt in self.planned.values() for path in pt.deliverables}
+        return {**self.known_owners, **owned}
 
     def check_project(self) -> list[Issue]:
         """Static validation plus (optionally) the runtime checks of the project type."""
@@ -393,48 +397,35 @@ Design notes are in `docs/architecture.md`; the QA and security reports are in `
 """
 
 
-def build_project(
-    description: str,
-    *,
-    out_dir: str | Path,
-    strategy: str = "adaptive",
-    llm: LLMFn | None = None,
-    config: BuildConfig | None = None,
-    progress: Progress | None = None,
-    on_update: Update | None = None,
-    project_type: str = "web",
-) -> BuildResult:
-    """Build software for ``description`` into ``out_dir`` with Gemini-driven agents.
-
-    ``project_type`` selects the profile: web, api, cli, library, data, database, game
-    or automation (see :mod:`ekatra.build.profiles`).
-    """
-    profile = get_profile(project_type)
+def wrap_llm(llm: LLMFn | None, cfg: BuildConfig) -> LLMFn:
+    """The model to call: Gemini by default, with at most ``max_concurrent_llm`` requests in flight."""
     if llm is None:
         from ekatra.llm.gemini import generate
 
-        def llm(prompt: str, json_mode: bool) -> str:  # noqa: F811
+        def raw(prompt: str, json_mode: bool) -> str:
             return generate(prompt, json_mode=json_mode, max_output_tokens=32768)
+    else:
+        raw = llm
+    gate = threading.BoundedSemaphore(max(1, cfg.max_concurrent_llm))
 
-    cfg = config or BuildConfig()
-    log = progress or (lambda message: None)
-    raw_llm, gate = llm, threading.BoundedSemaphore(max(1, cfg.max_concurrent_llm))
-
-    def llm(prompt: str, json_mode: bool) -> str:  # noqa: F811 - rate-limited wrapper
+    def limited(prompt: str, json_mode: bool) -> str:
         with gate:
-            return raw_llm(prompt, json_mode)
+            return raw(prompt, json_mode)
 
-    workspace = Workspace(out_dir)
-    log(f"Planning a {profile.noun} with the Project Manager ({strategy} strategy)...")
-    planned = plan_project_full(description, llm, profile)
-    plan, plan_source, package = planned.tasks, planned.source, planned.package
-    log(f"Plan ({plan_source}): {len(plan)} tasks" + (f", package `{package}`" if package else ""))
-    for pt in plan:
-        log(f"  - {pt.key} [{pt.role}] -> {', '.join(pt.deliverables)}")
+    return limited
 
-    build = _LiveBuild(description, strategy, workspace, llm, cfg, log, on_update, profile, package)
-    build.plan_source = plan_source
-    build.create_tasks(plan)
+
+def run_and_save(
+    build: "_LiveBuild",
+    *,
+    cfg: BuildConfig,
+    description: str,
+    plan_source: str,
+    run_file: str = "ekatra-run.json",
+    extra: dict[str, Any] | None = None,
+) -> BuildResult:
+    """Drive a prepared build to the end: execute, repair, finish, then save the artifacts."""
+    workspace, profile, package, strategy = build.workspace, build.profile, build.package, build.strategy
     with ThreadPoolExecutor(max_workers=cfg.max_workers) as executor:
         build.executor = executor
         build.drive()
@@ -466,11 +457,47 @@ def build_project(
         },
     )
     import json
-    workspace.write_text("ekatra-run.json", json.dumps({
+    workspace.write_text(run_file, json.dumps({
         **record.to_dict(), "tasks": state["tasks"], "agents": state["agents"],
         "decisions": state["adaptive_decisions"], "final_issues": issues, "errors": build.errors,
+        "owners": build.owners(), **(extra or {}),
     }, indent=2, default=str))
     return BuildResult(workspace.root, strategy, plan_source, state, metrics, issues)
+
+
+def build_project(
+    description: str,
+    *,
+    out_dir: str | Path,
+    strategy: str = "adaptive",
+    llm: LLMFn | None = None,
+    config: BuildConfig | None = None,
+    progress: Progress | None = None,
+    on_update: Update | None = None,
+    project_type: str = "web",
+) -> BuildResult:
+    """Build software for ``description`` into ``out_dir`` with Gemini-driven agents.
+
+    ``project_type`` selects the profile: web, api, cli, library, data, database, game
+    or automation (see :mod:`ekatra.build.profiles`).
+    """
+    profile = get_profile(project_type)
+    cfg = config or BuildConfig()
+    log = progress or (lambda message: None)
+    llm = wrap_llm(llm, cfg)
+
+    workspace = Workspace(out_dir)
+    log(f"Planning a {profile.noun} with the Project Manager ({strategy} strategy)...")
+    planned = plan_project_full(description, llm, profile)
+    plan, plan_source, package = planned.tasks, planned.source, planned.package
+    log(f"Plan ({plan_source}): {len(plan)} tasks" + (f", package `{package}`" if package else ""))
+    for pt in plan:
+        log(f"  - {pt.key} [{pt.role}] -> {', '.join(pt.deliverables)}")
+
+    build = _LiveBuild(description, strategy, workspace, llm, cfg, log, on_update, profile, package)
+    build.plan_source = plan_source
+    build.create_tasks(plan)
+    return run_and_save(build, cfg=cfg, description=description, plan_source=plan_source)
 
 
 def _model_config() -> dict[str, Any]:
@@ -481,4 +508,4 @@ def _model_config() -> dict[str, Any]:
             "temperature": settings.model_temperature}
 
 
-__all__ = ["BuildConfig", "BuildResult", "LIVE_WORKLOAD", "LiveClock", "build_project"]
+__all__ = ["BuildConfig", "BuildResult", "LIVE_WORKLOAD", "LiveClock", "build_project", "run_and_save", "wrap_llm"]

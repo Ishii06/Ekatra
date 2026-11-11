@@ -109,8 +109,14 @@ def fallback_package(description: str) -> str:
     return name if valid_package(name) else "app"
 
 
-def validate_plan(raw: Any, profile: Profile = WEB, package: str | None = None) -> list[PlannedTask]:
-    """Validate a parsed LLM plan for ``profile`` and return normalized tasks."""
+def validate_plan(raw: Any, profile: Profile = WEB, package: str | None = None, *,
+                  strict: bool = True) -> list[PlannedTask]:
+    """Validate a parsed LLM plan for ``profile`` and return normalized tasks.
+
+    ``strict=False`` is used for change requests: the per-task rules (roles, write
+    locations, dependencies, file ownership) still apply, but the plan need not contain
+    every role, the entry files or the tests - those already exist in the project.
+    """
     items = raw.get("tasks") if isinstance(raw, dict) else raw
     if not isinstance(items, list) or not items:
         raise PlanError("plan must contain a non-empty 'tasks' list")
@@ -160,6 +166,8 @@ def validate_plan(raw: Any, profile: Profile = WEB, package: str | None = None) 
             )
         )
 
+    if not strict:
+        return tasks
     roles = {t.role for t in tasks}
     for needed in profile.required_roles:
         if needed not in roles:

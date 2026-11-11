@@ -16,6 +16,7 @@ import {
   Rocket,
   Square,
   ScrollText,
+  Wrench,
   X,
 } from "lucide-react";
 import { useDashboard } from "@/lib/dashboard-context";
@@ -373,6 +374,93 @@ function ProjectChecks({ build }: { build: BuildStateResponse }) {
   );
 }
 
+const CHANGE_EXAMPLES = [
+  "Add a dark mode toggle",
+  "The list command should also show the due date",
+  "Validate that the email field really looks like an email address",
+];
+
+function ChangePanel({ build }: { build: BuildStateResponse }) {
+  const { changeBuild } = useDashboard();
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const hasIssues = build.final_issues.length > 0;
+
+  async function apply(request?: string) {
+    setBusy(true);
+    await changeBuild(request);
+    if (request) setText("");
+    setBusy(false);
+  }
+
+  const button =
+    "mono inline-flex items-center gap-2 rounded-lg border px-4 py-2 text-[11px] uppercase tracking-[0.14em] transition-all disabled:cursor-not-allowed disabled:opacity-50";
+
+  return (
+    <Panel
+      eyebrow="Change"
+      title="Change or fix this project"
+      icon={<Wrench className="h-4 w-4" />}
+      subtitle="Describe what should be different. The Project Manager plans the smallest change, agents rewrite only the files involved, QA updates the tests, and the checks run again — a change that breaks something is repaired or reported."
+      actions={build.changes.length > 0 ? <Chip tone="violet">{build.changes.length} APPLIED</Chip> : undefined}
+      bodyClassName="p-4"
+    >
+      <label htmlFor="change-request" className="sr-only">
+        Change request
+      </label>
+      <textarea
+        id="change-request"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        disabled={busy}
+        rows={2}
+        maxLength={600}
+        placeholder={`e.g. ${CHANGE_EXAMPLES[build.changes.length % CHANGE_EXAMPLES.length]}`}
+        className="w-full resize-none rounded-xl border border-line-soft bg-black/30 px-3 py-2.5 text-[13px] text-fg outline-none transition-colors placeholder:text-fg-dim focus:border-accent/60 disabled:opacity-60"
+      />
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <button
+          onClick={() => apply(text)}
+          disabled={busy || text.trim().length < 5}
+          className={cn(button, "border-accent/50 bg-accent/15 text-accent hover:bg-accent/25")}
+        >
+          {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wrench className="h-3.5 w-3.5" />}
+          Apply change
+        </button>
+        {hasIssues && (
+          <button
+            onClick={() => apply()}
+            disabled={busy}
+            className={cn(button, "border-amber/50 bg-amber/10 text-amber hover:bg-amber/15")}
+          >
+            <AlertTriangle className="h-3.5 w-3.5" />
+            Fix {build.final_issues.length} remaining issue{build.final_issues.length === 1 ? "" : "s"}
+          </button>
+        )}
+        <span className="text-[11px] text-fg-dim">{text.length}/600</span>
+      </div>
+      {build.change_error && (
+        <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber/40 bg-amber/10 px-3 py-2 text-[12px] text-amber">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            The change was not applied: {build.change_error} The project is as it was before.
+          </span>
+        </div>
+      )}
+      {build.changes.length > 0 && (
+        <div className="mt-4 border-t border-line-soft pt-3">
+          <div className="mono mb-1.5 text-[9px] uppercase tracking-[0.2em] text-accent/80">Changes so far</div>
+          <ol className="list-decimal space-y-1 pl-5 text-[12px] text-fg-muted">
+            {build.changes.map((c, i) => (
+              <li key={`${c.at}-${i}`}>{c.request}</li>
+            ))}
+          </ol>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
 /** The commands a person would run themselves, per project type. */
 function runInstructions(build: BuildStateResponse): string {
   const pkg = build.package || "app";
@@ -591,6 +679,9 @@ export function BuildPanel() {
         </div>
       )}
 
+      {finished && build.status === "completed" && (
+        <ChangePanel key={`${build.run_id}-${build.changes.length}`} build={build} />
+      )}
       {finished && build.status === "completed" && build.runnable && (
         <SitePreview key={build.run_id} build={build} />
       )}

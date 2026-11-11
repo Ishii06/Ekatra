@@ -271,7 +271,18 @@ def _pytest_issues(root: Path, pkg: str, profile: Profile, owners: dict[str, str
     issues: list[Issue] = []
     if "ModuleNotFoundError" in output or "ImportError" in output or "SyntaxError" in output:
         target = code_file or test_file or f"{pkg}/__init__.py"
-        return [_issue("high", _owner(target, owners, profile), target, f"pytest could not run the tests:\n{tail}")]
+        issues.append(_issue("high", _owner(target, owners, profile), target,
+                             f"pytest could not run the tests:\n{tail}"))
+        # "cannot import name X from pkg.mod": the module that should define X is at fault too
+        missing = re.search(r"cannot import name '(\w+)' from '([\w.]+)'", output)
+        if missing and missing.group(2).startswith(pkg):
+            module = missing.group(2).replace(".", "/") + ".py"
+            if module != target and (root / module).is_file():
+                issues.append(_issue(
+                    "high", _owner(module, owners, profile), module,
+                    f"pytest could not import `{missing.group(1)}` from `{missing.group(2)}`. Define it there "
+                    f"if the architecture or the change request requires it.\n{tail}"))
+        return issues
     test_target = test_file or next((p for p, r in owners.items() if r == "qa" and p.startswith("tests/")),
                                     f"tests/test_{pkg}.py")
     if code_file:

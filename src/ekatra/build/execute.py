@@ -98,8 +98,14 @@ def _is_report_task(planned: PlannedTask) -> bool:
 
 def _developer_prompt(role: str, planned: PlannedTask, description: str, arch: str,
                       files_ctx: str, listing: list[str], fix_issues: list[Issue],
-                      previous_error: str = "", profile: Profile = WEB, pkg: str = "") -> str:
+                      previous_error: str = "", profile: Profile = WEB, pkg: str = "",
+                      change_request: str = "") -> str:
     fixing = _retry_note(previous_error)
+    if change_request:
+        fixing += (f"\nCHANGE REQUEST from the user: {change_request}\n"
+                   "This is a CHANGE to an existing, working project. Rewrite each file listed below COMPLETELY "
+                   "with the change applied. Keep everything else that already works exactly as it is: the same "
+                   "function names, routes, commands and data formats, unless the change requires otherwise.\n")
     if fix_issues:
         lines = "\n".join(f"- [{i['severity']}] {i['file']}: {i['description']}" for i in fix_issues)
         fixing += f"\nThis is a FIX task. Correct these problems by rewriting the files below:\n{lines}\n"
@@ -187,6 +193,7 @@ def execute_task(
     profile: Profile = WEB,
     package: str = "",
     evidence_fn: Callable[[], list[Issue]] | None = None,
+    change_request: str = "",
 ) -> TaskOutcome:
     """Run one planned task as ``agent`` and return a structured outcome."""
     role = planned.role
@@ -208,6 +215,7 @@ def execute_task(
                 role, planned, description, arch,
                 _context(agent, task_id, dependency_paths or []),
                 _project_files(workspace), fix_issues or [], previous_error, profile, package,
+                change_request,
             )
         data = extract_json(llm(prompt, True))
         if not isinstance(data, dict):
