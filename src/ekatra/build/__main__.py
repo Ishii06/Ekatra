@@ -1,4 +1,4 @@
-"""CLI: ``python -m ekatra.build "<website description>"``."""
+"""CLI: ``python -m ekatra.build "<description>" [--type cli|api|web|...]``."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from ekatra.build.live import BuildConfig, build_project
+from ekatra.build.profiles import PROFILES, get_profile
 from ekatra.config.settings import get_settings
 
 
@@ -17,7 +18,9 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m ekatra.build",
         description="Build a working website with Gemini-driven Ekatra agents.",
     )
-    parser.add_argument("description", help="what the website should do")
+    parser.add_argument("description", help="what the software should do")
+    parser.add_argument("--type", choices=sorted(PROFILES), default="web", dest="project_type",
+                        help="kind of software to build (default: web)")
     parser.add_argument("--strategy", choices=("adaptive", "fixed"), default="adaptive")
     parser.add_argument("--out", help="output folder (default: projects/<name>-<strategy>)")
     parser.add_argument("--max-agents", type=int, default=3, help="max agents per spawnable role")
@@ -30,12 +33,13 @@ def main(argv: list[str] | None = None) -> int:
         print("GEMINI_API_KEY is not set (add it to .env).", file=sys.stderr)
         return 2
     slug = re.sub(r"[^a-z0-9]+", "-", args.description.lower()).strip("-")[:32] or "site"
-    out = Path(args.out) if args.out else Path("projects") / f"{slug}-{args.strategy}-{int(time.time()) % 100000}"
+    out = Path(args.out) if args.out else Path("projects") / f"{slug}-{args.project_type}-{args.strategy}-{int(time.time()) % 100000}"
     print(f"Building into {out} ...", flush=True)
     result = build_project(
         args.description,
         out_dir=out,
         strategy=args.strategy,
+        project_type=args.project_type,
         config=BuildConfig(max_agents_per_role=args.max_agents, repair_rounds=args.repair_rounds,
                             smoke_test=not args.no_smoke_test),
         progress=lambda message: print(message, flush=True),
@@ -46,10 +50,10 @@ def main(argv: list[str] | None = None) -> int:
           f"{adaptive['spawn_events']} spawned, {adaptive['reassignment_events']} reassigned, "
           f"peak {agent['peak_active_agents']} agents active.")
     high = [i for i in result.final_issues if i["severity"] == "high"]
-    print(f"Static validation: {len(result.final_issues)} issue(s), {len(high)} high.")
+    print(f"Checks: {len(result.final_issues)} issue(s), {len(high)} high.")
     for issue in result.final_issues[:8]:
         print(f"  - [{issue['severity']}] {issue['file']}: {issue['description']}")
-    print(f"\nRun it:  cd {out} && pip install -r requirements.txt && uvicorn backend.main:app --reload")
+    print(f"\nBuilt a {get_profile(args.project_type).noun} in {out}. See {out}/README.md for how to run it.")
     return 0 if result.success else 1
 
 

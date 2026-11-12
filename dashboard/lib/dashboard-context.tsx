@@ -36,7 +36,10 @@ import {
   followBuild,
   getBuild,
   listBuilds,
+  listProfiles,
+  requestChange as apiRequestChange,
   startBuild as apiStartBuild,
+  type BuildProfile,
   type BuildStateResponse,
 } from "./api/builds";
 
@@ -92,10 +95,15 @@ interface DashboardValue {
   /* real build (Gemini-driven) */
   buildDescription: string;
   setBuildDescription: (text: string) => void;
+  profiles: BuildProfile[];
+  projectType: string;
+  setProjectType: (key: string) => void;
   build: BuildStateResponse | null;
   buildRunning: boolean;
   buildStarting: boolean;
   startBuild: () => Promise<void>;
+  /** Change the finished project; empty text means "fix the remaining issues". */
+  changeBuild: (text?: string) => Promise<void>;
   openBuild: (buildId: string) => void;
 
   /* provenance */
@@ -134,7 +142,10 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
 
   /* Real build state, fed by the backend's SSE stream. */
   const [buildDescription, setBuildDescription] = useState(DEFAULT_BUILD_DESCRIPTION);
+  const [profiles, setProfiles] = useState<BuildProfile[]>([]);
+  const [projectType, setProjectTypeState] = useState("web");
   const [buildId, setBuildId] = useState<string | null>(null);
+  const [followNonce, setFollowNonce] = useState(0);
   const [build, setBuild] = useState<BuildStateResponse | null>(null);
   const [buildSnapshot, setBuildSnapshot] = useState<OrgSnapshot | null>(null);
   const [buildStarting, setBuildStarting] = useState(false);
@@ -197,10 +208,11 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     if (mode !== "build") return;
     let cancelled = false;
     getHealth()
-      .then(() => listBuilds())
-      .then((list) => {
+      .then(() => Promise.all([listBuilds(), listProfiles()]))
+      .then(([list, types]) => {
         if (cancelled) return;
         setLiveError(null);
+        setProfiles(types);
         if (!buildId && list.length > 0) setBuildId(list[0].run_id);
       })
       .catch((e: unknown) => {
@@ -217,8 +229,22 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (mode !== "build" || !buildId) return;
     let stopped = false;
-    const apply = (state: BuildStateResponse) => {
+    const apply = (raw: BuildStateResponse) => {
       if (stopped) return;
+      /* Older backends omit newer fields; default them so the panels never crash. */
+      const state: BuildStateResponse = {
+        ...raw,
+        changes: raw.changes ?? [],
+        change_error: raw.change_error ?? null,
+        files: raw.files ?? [],
+        log: raw.log ?? [],
+        final_issues: raw.final_issues ?? [],
+        has_tests: raw.has_tests ?? false,
+        runnable: raw.runnable ?? "",
+        project_label: raw.project_label ?? "Project",
+        project_type: raw.project_type ?? "web",
+        package: raw.package ?? "",
+      };
       setBuild(state);
       setBuildSnapshot(convertRunStateToSnapshot(state, "Live build"));
       setLiveError(state.error ?? null);
@@ -239,7 +265,7 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
       stopped = true;
       close();
     };
-  }, [mode, buildId]);
+  }, [mode, buildId, followNonce]);
 
   useEffect(() => {
     if (mode !== "live") return;
@@ -377,7 +403,7 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     setBuildStarting(true);
     setLiveError(null);
     try {
-      const started = await apiStartBuild(text, strategy);
+      const started = await apiStartBuild(text, strategy, 2, projectType);
       setBuild(null);
       setBuildSnapshot(null);
       setBuildId(started.run_id);
@@ -386,7 +412,35 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setBuildStarting(false);
     }
-  }, [buildDescription, strategy]);
+  }, [buildDescription, strategy, projectType]);
+
+  /* Switching type swaps in that type's example unless the user wrote their own text. */
+  const setProjectType = useCallback(
+    (key: string) => {
+      const examples = new Set([DEFAULT_BUILD_DESCRIPTION, ...profiles.map((p) => p.example)]);
+      const next = profiles.find((p) => p.key === key);
+      setProjectTypeState(key);
+      setBuildDescription((current) =>
+        next && (current.trim() === "" || examples.has(current)) ? next.example : current,
+      );
+    },
+    [profiles],
+  );
+
+  const changeBuild = useCallback(
+    async (text?: string) => {
+      if (!buildId) return;
+      setLiveError(null);
+      try {
+        await apiRequestChange(buildId, text);
+        setBuild((current) => (current ? { ...current, status: "running", change_error: null } : current));
+        setFollowNonce((n) => n + 1); /* re-attach to the live stream for this change */
+      } catch (e) {
+        setLiveError(e instanceof Error ? e.message : "Failed to start the change");
+      }
+    },
+    [buildId],
+  );
 
   const openBuild = useCallback((id: string) => {
     setBuild(null);
@@ -515,10 +569,14 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     liveError,
     buildDescription,
     setBuildDescription,
+    profiles,
+    projectType,
+    setProjectType,
     build,
     buildRunning,
     buildStarting,
     startBuild,
+    changeBuild,
     openBuild,
   };
 

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -29,8 +30,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ekatra.api.summary import workload_and_risk
+from ekatra.build import pychecks
+from ekatra.build.execute import is_visible
+from ekatra.build.change import MAX_REQUEST_CHARS, change_project
 from ekatra.build.live import LIVE_WORKLOAD, BuildConfig, build_project
-from ekatra.build.plan import LLMFn
+from ekatra.build.profiles import PROFILES, get_profile
+from ekatra.build.plan import LLMFn, PlanError
 from ekatra.build.smoke import scrubbed_env
 from ekatra.config.settings import get_settings
 from ekatra.observability.metrics import compute_metrics
@@ -43,8 +48,7 @@ BUILDS: dict[str, dict[str, Any]] = {}
 SMOKE_TEST = True  # run the generated app during the build; tests switch it off
 _LOCK = threading.Lock()
 
-_SHOWN_DIRS = {"backend", "frontend", "docs"}
-_SHOWN_ROOT_FILES = {"README.md", "requirements.txt"}
+_AREAS = {"backend", "frontend", "docs", "tests", "data"}
 _MAX_FILE_BYTES = 300_000
 _LOG_TAIL = 400
 
@@ -53,6 +57,7 @@ class BuildCreateRequest(BaseModel):
     description: str = Field(..., min_length=10, max_length=600)
     strategy: str = Field("adaptive", pattern="^(fixed|adaptive)$")
     repair_rounds: int = Field(2, ge=0, le=3)
+    project_type: str = Field("web", pattern="^(" + "|".join(PROFILES) + ")$")
 
 
 def _make_llm() -> LLMFn | None:
@@ -89,6 +94,7 @@ def _run_build(build_id: str) -> None:
             config=BuildConfig(repair_rounds=entry["repair_rounds"], smoke_test=SMOKE_TEST),
             progress=progress,
             on_update=on_update,
+            project_type=entry["project_type"],
         )
         entry["state"] = result.state
         entry["success"] = result.success
@@ -105,14 +111,14 @@ def _list_files(out_dir: Path) -> list[dict[str, Any]]:
     workspace = Workspace(out_dir)
     files = []
     for rel in workspace.list_files("."):
-        top = rel.split("/")[0]
-        if top not in _SHOWN_DIRS and rel not in _SHOWN_ROOT_FILES:
+        if not is_visible(rel):
             continue
+        top = rel.split("/")[0]
         info = workspace.metadata(rel)
         files.append({
             "path": rel,
             "bytes": info["size_bytes"],
-            "area": top if top in _SHOWN_DIRS else "project",
+            "area": top if top in _AREAS else ("project" if "/" not in rel else "source"),
             "modified_at": datetime.fromtimestamp(
                 workspace.resolve(rel).stat().st_mtime, tz=timezone.utc).isoformat(),
         })
@@ -124,7 +130,13 @@ def _payload(entry: dict[str, Any]) -> dict[str, Any]:
     workload, risk = workload_and_risk(state, LIVE_WORKLOAD)
     metrics = compute_metrics(state).to_dict()
     end = entry.get("finished_at") or time.time()
+    profile = get_profile(entry["project_type"])
     return {
+        "project_type": profile.key,
+        "project_label": profile.label,
+        "runnable": profile.runnable,
+        "has_tests": profile.kind == "python",
+        "package": state.get("package", ""),
         "run_id": entry["build_id"],
         "scenario_id": "live_build",
         "strategy": entry["strategy"],
@@ -150,6 +162,8 @@ def _payload(entry: dict[str, Any]) -> dict[str, Any]:
         "log": entry["log"][-_LOG_TAIL:],
         "final_issues": state.get("final_issues", []),
         "out_dir": str(entry["out_dir"]),
+        "changes": entry.get("changes", []),
+        "change_error": entry.get("change_error"),
     }
 
 
@@ -171,7 +185,7 @@ def start_build(req: BuildCreateRequest) -> dict[str, Any]:
         BUILDS[build_id] = {
             "build_id": build_id, "description": req.description.strip(), "strategy": req.strategy,
             "repair_rounds": req.repair_rounds, "status": "running", "state": _empty_state(),
-            "log": [f"Planning with the Project Manager ({req.strategy} strategy)..."],
+            "log": [], "project_type": req.project_type, "changes": [],
             "version": 0, "started_at": time.time(), "finished_at": None, "error": None,
             "out_dir": PROJECTS_DIR / f"{_slug(req.description)}-{req.strategy}-{build_id[-6:]}",
         }
@@ -180,7 +194,7 @@ def start_build(req: BuildCreateRequest) -> dict[str, Any]:
 
 
 @router.get("/builds")
-def list_builds() -> list[dict[str, Any]]:
+def list_builds() -> list[dict[str, Any]]:  # noqa: D103
     return [
         {"run_id": b["build_id"], "description": b["description"], "strategy": b["strategy"],
          "status": b["status"], "started_at": b["started_at"]}
@@ -228,8 +242,7 @@ def list_build_files(build_id: str) -> list[dict[str, Any]]:
 @router.get("/builds/{build_id}/files/{path:path}")
 def read_build_file(build_id: str, path: str) -> dict[str, Any]:
     entry = _get(build_id)
-    top = path.split("/")[0]
-    if top not in _SHOWN_DIRS and path not in _SHOWN_ROOT_FILES:
+    if not is_visible(path):
         raise HTTPException(status_code=404, detail="File not found")
     workspace = Workspace(entry["out_dir"])
     try:
@@ -291,7 +304,10 @@ def _stop_all_sites() -> None:
 
 def _site_status(build_id: str) -> dict[str, Any]:
     running = _site_running(build_id)
-    return {"running": running, "url": SITE_URLS.get(build_id) if running else None}
+    url = SITE_URLS.get(build_id) if running else None
+    entry = BUILDS.get(build_id)
+    api = bool(entry) and entry["project_type"] == "api"
+    return {"running": running, "url": url, "docs_url": url + "docs" if url and api else None}
 
 
 @router.get("/builds/{build_id}/launch")
@@ -306,8 +322,13 @@ def launch_site(build_id: str) -> dict[str, Any]:
     if entry["status"] == "running":
         raise HTTPException(status_code=409, detail="The build is still running")
     out_dir = Path(entry["out_dir"])
-    if not (out_dir / "backend" / "main.py").is_file():
-        raise HTTPException(status_code=400, detail="The build has no backend/main.py to run")
+    profile = get_profile(entry["project_type"])
+    if not profile.runnable:
+        raise HTTPException(status_code=400, detail=f"A {profile.noun} has no server to start; use Run tests or Run demo")
+    package = entry["state"].get("package") or ""
+    module = "backend.main" if profile.key == "web" else f"{package}.main"
+    if not (out_dir / (module.replace(".", "/") + ".py")).is_file():
+        raise HTTPException(status_code=400, detail=f"The build has no {module.replace('.', '/')}.py to run")
     if _site_running(build_id):
         return _site_status(build_id)
     if sum(1 for b in SITES if _site_running(b)) >= _MAX_SITES:
@@ -317,7 +338,7 @@ def launch_site(build_id: str) -> dict[str, Any]:
     log_path = out_dir / "ekatra-site.log"
     with open(log_path, "w", encoding="utf-8") as log:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "backend.main:app", "--host", "127.0.0.1", "--port", str(port)],
+            [sys.executable, "-m", "uvicorn", f"{module}:app", "--host", "127.0.0.1", "--port", str(port)],
             cwd=out_dir, env=_site_env(), stdout=log, stderr=subprocess.STDOUT,
         )
     url = f"http://127.0.0.1:{port}/"
@@ -327,10 +348,15 @@ def launch_site(build_id: str) -> dict[str, Any]:
             break
         try:
             urllib.request.urlopen(url, timeout=1).close()
+            up = True
+        except urllib.error.HTTPError:
+            up = True  # the server answered (an API service has no homepage)
+        except Exception:  # noqa: BLE001 - not ready yet
+            up = False
+        if up:
             SITES[build_id], SITE_URLS[build_id] = proc, url
             return _site_status(build_id)
-        except Exception:  # noqa: BLE001 - not ready yet
-            time.sleep(0.3)
+        time.sleep(0.3)
     if proc.poll() is None:
         proc.kill()
     tail = log_path.read_text(encoding="utf-8", errors="replace")[-600:].strip()
@@ -344,4 +370,159 @@ def stop_site(build_id: str) -> dict[str, Any]:
     return _site_status(build_id)
 
 
-__all__ = ["BUILDS", "PROJECTS_DIR", "SITES", "router"]
+# -- changing an existing project ----------------------------------------------
+
+
+class ChangeRequest(BaseModel):
+    """What to change. Leave ``request`` empty to only re-check the project and fix its issues."""
+
+    request: str | None = Field(None, max_length=MAX_REQUEST_CHARS)
+
+
+def _run_change(build_id: str, request: str, previous: tuple[dict[str, Any], bool | None]) -> None:
+    entry = BUILDS[build_id]
+
+    def progress(message: str) -> None:
+        entry["log"].append(message)
+        entry["version"] += 1
+
+    def on_update(state: dict[str, Any]) -> None:
+        entry["state"] = state
+        entry["version"] += 1
+
+    try:
+        result = change_project(
+            entry["out_dir"], request or None,
+            project_type=entry["project_type"], package=previous[0].get("package", ""),
+            description=entry["description"], strategy=entry["strategy"], llm=_make_llm(),
+            # A change or fix request always gets repair rounds, whatever the original build used.
+            config=BuildConfig(repair_rounds=max(2, entry["repair_rounds"]), smoke_test=SMOKE_TEST),
+            progress=progress, on_update=on_update,
+        )
+        entry["state"] = result.state
+        entry["success"] = result.success
+    except Exception as exc:  # noqa: BLE001 - the project itself is still there; report and restore the view
+        entry["state"], entry["success"] = previous
+        entry["change_error"] = f"{type(exc).__name__}: {str(exc)[:400]}" if not isinstance(
+            exc, (PlanError, ValueError)) else str(exc)[:400]
+        entry["log"].append(f"The change could not be applied: {entry['change_error']}")
+    finally:
+        entry["status"] = "completed"
+        entry["finished_at"] = time.time()
+        entry["version"] += 1
+
+
+@router.post("/builds/{build_id}/changes")
+def change_build(build_id: str, req: ChangeRequest) -> dict[str, Any]:
+    entry = _get(build_id)
+    request = (req.request or "").strip()
+    if not request and not entry["state"].get("final_issues"):
+        raise HTTPException(status_code=400, detail="Describe the change you want (there are no issues to fix)")
+    if _make_llm() is None and not get_settings().has_api_key():
+        raise HTTPException(status_code=400, detail="GEMINI_API_KEY is not configured on the server")
+    with _LOCK:
+        if any(b["status"] == "running" for b in BUILDS.values()):
+            raise HTTPException(status_code=409, detail="A build is already running")
+        previous = (entry["state"], entry.get("success"))
+        fresh = _empty_state()
+        fresh.update(package=previous[0].get("package", ""), project_type=entry["project_type"],
+                     plan_source="change" if request else "repair")
+        entry.update(status="running", state=fresh, success=None, finished_at=None, started_at=time.time(),
+                     change_error=None)
+        entry.setdefault("changes", []).append({"request": request or "(fix remaining issues)", "at": time.time()})
+        entry["log"].append(f"---- Change request: {request or 'fix remaining issues'} ----")
+        entry["version"] += 1
+        threading.Thread(target=_run_change, args=(build_id, request, previous), daemon=True).start()
+    return {"run_id": build_id, "status": "running"}
+
+
+# -- projects built before this server started ----------------------------------
+
+_SAFE_FOLDER = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _state_from_run_file(data: dict[str, Any]) -> dict[str, Any]:
+    config = data.get("config") or {}
+    return {
+        "tasks": data.get("tasks", []), "agents": data.get("agents", []),
+        "observability_events": data.get("raw_events", []), "adaptive_decisions": data.get("decisions", []),
+        "communication": [], "tool_calls": [], "plan_source": config.get("plan_source", ""),
+        "final_issues": data.get("final_issues", []), "project_type": config.get("project_type", "web"),
+        "package": config.get("package", ""),
+    }
+
+
+def load_builds_from_disk() -> int:
+    """Register finished projects found in ``projects/`` so they survive a server restart."""
+    if not PROJECTS_DIR.is_dir():
+        return 0
+    loaded = 0
+    for folder in sorted(PROJECTS_DIR.iterdir()):
+        run_file = folder / "ekatra-run.json"
+        build_id = f"disk-{folder.name}"
+        if not folder.is_dir() or not _SAFE_FOLDER.match(folder.name) or not run_file.is_file() or build_id in BUILDS:
+            continue
+        try:
+            base = json.loads(run_file.read_text(encoding="utf-8"))
+            change_files = sorted(folder.glob("ekatra-change-*.json"), key=lambda p: p.stat().st_mtime)
+            latest = json.loads(change_files[-1].read_text(encoding="utf-8")) if change_files else base
+            changes = [{"request": json.loads(p.read_text(encoding="utf-8")).get("change_request")
+                        or "(fix remaining issues)", "at": p.stat().st_mtime} for p in change_files]
+        except (OSError, ValueError):
+            continue
+        state = _state_from_run_file(latest)
+        base_config = base.get("config") or {}
+        project_type = base_config.get("project_type") if base_config.get("project_type") in PROFILES else "web"
+        state["project_type"], state["package"] = project_type, base_config.get("package", "")
+        stamp = (change_files[-1] if change_files else run_file).stat().st_mtime
+        tasks = state["tasks"]
+        BUILDS[build_id] = {
+            "build_id": build_id, "description": base.get("project_description", ""),
+            "strategy": base.get("strategy", "adaptive"), "repair_rounds": 2, "status": "completed",
+            "success": bool(tasks) and all(t.get("status") == "COMPLETED" for t in tasks)
+            and not any(i.get("severity") == "high" for i in state["final_issues"]),
+            "state": state, "log": [f"Loaded from {folder.name} (built earlier)"], "project_type": project_type,
+            "version": 0, "started_at": stamp, "finished_at": stamp, "error": None, "out_dir": folder,
+            "changes": changes,
+        }
+        loaded += 1
+    return loaded
+
+
+# -- project types, tests and demos -------------------------------------------
+
+
+@router.get("/build-profiles")
+def list_profiles() -> list[dict[str, Any]]:
+    return [p.public() for p in PROFILES.values()]
+
+
+def _finished_python_build(build_id: str):
+    entry = _get(build_id)
+    if entry["status"] == "running":
+        raise HTTPException(status_code=409, detail="The build is still running")
+    profile = get_profile(entry["project_type"])
+    if profile.kind != "python":
+        raise HTTPException(status_code=400, detail="Only Python project types have tests and a demo")
+    return entry, profile
+
+
+@router.post("/builds/{build_id}/tests")
+def run_build_tests(build_id: str) -> dict[str, Any]:
+    entry, _ = _finished_python_build(build_id)
+    root = Path(entry["out_dir"])
+    if not (root / "tests").is_dir():
+        raise HTTPException(status_code=400, detail="The build has no tests/ folder")
+    return pychecks.run_tests(root)
+
+
+@router.post("/builds/{build_id}/demo")
+def run_build_demo(build_id: str) -> dict[str, Any]:
+    entry, profile = _finished_python_build(build_id)
+    results = pychecks.run_demo(Path(entry["out_dir"]), entry["state"].get("package") or "", profile)
+    if not results:
+        raise HTTPException(status_code=400, detail=f"A {profile.noun} has no demo command; use Run tests")
+    return {"ok": all(r["ok"] for r in results), "results": results}
+
+
+__all__ = ["BUILDS", "PROJECTS_DIR", "SITES", "load_builds_from_disk", "router"]

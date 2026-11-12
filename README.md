@@ -132,47 +132,63 @@ The adaptive controller is deterministic and separate from LLM reasoning. Planni
 code generation use Gemini only in the real build mode below; the experiments use
 mock agents on a simulated clock.
 
-## Build a Real Website (Gemini)
+## Build Real Software (Gemini)
 
-Ekatra can build an actual website. Gemini-driven agents plan the project, write
-the files, review each other's work and fix what the review finds, orchestrated
-by the same fixed/adaptive strategies the experiments evaluate.
+Ekatra builds real software, not just websites. Gemini-driven agents plan the
+project, write the files, QA writes and runs tests, Security reviews, and a repair
+loop fixes what the checks find, orchestrated by the same fixed/adaptive strategies
+the experiments evaluate.
+
+| `--type` | What is built | How it is checked |
+|---|---|---|
+| `web` (default) | FastAPI backend serving an HTML/CSS/JS frontend | imports, assets, API contract, smoke test of the app |
+| `api` | FastAPI REST service with documented routes | imports the app, calls every GET route, OpenAPI schema, `pytest` |
+| `cli` | `argparse` tool with subcommands, run as `python -m <package>` | `--help` runs, `pytest` |
+| `library` | importable package with a public API | `import <package>`, `pytest` |
+| `data` | script that reads a bundled CSV and writes a report to `output/` | runs on the sample data, output exists, `pytest` |
+| `database` | SQLite schema and query layer with a demo | runs the seeded demo, `pytest` |
+| `game` | rules engine plus a terminal loop reading stdin | scripted session ends cleanly, `pytest` |
+| `automation` | file-processing script with `--dry-run` / `--apply` | `--help` and a dry run on a sample folder, `pytest` |
 
 ```bash
 # from the project root, with GEMINI_API_KEY and GEMINI_MODEL set in .env
 set PYTHONPATH=src                      # PowerShell: $env:PYTHONPATH = "src"
 python -m ekatra.build "A student wellbeing website with counsellor booking and a mood journal" --strategy adaptive
+python -m ekatra.build "A command-line to-do manager with add, list, done, delete and stats" --type cli
 ```
 
-The site is written to `projects/<name>-<strategy>-<id>/` (git-ignored) as a
-FastAPI backend that serves a static HTML/CSS/JS frontend:
-
-```bash
-cd projects/<name>...
-pip install -r requirements.txt
-uvicorn backend.main:app --reload       # open http://127.0.0.1:8000
-```
+The project is written to `projects/<name>-<type>-<strategy>-<id>/` (git-ignored);
+its `README.md` says how to run it. Web projects use `backend/` and `frontend/`.
+Every other type puts code in a package `<package>/` (named by the planner), tests in
+`tests/`, documents in `docs/`.
 
 How it works (`src/ekatra/build/`):
 
+* **profiles** – `profiles.py` is the only place that knows what a project type looks
+  like: file layout, which role may write where, the standards and plan rules given to
+  agents, the fallback plan and the checks. The six agent roles, task manager,
+  controller and metrics are identical for every type. For the Python types the Backend
+  developer owns core logic, the Frontend developer owns the user-facing layer (command
+  line, terminal loop, report rendering) when there is one, and **QA writes the pytest
+  tests** (QA may write under `tests/` and `docs/` only).
 * **plan** – the Project Manager asks Gemini for a task list (roles, dependencies,
-  one owner per file). The reply is validated (roles, dependency order, file
-  ownership, size) and a deterministic plan is used if it is unusable.
+  one owner per file, and for Python types the package name). The reply is validated
+  (roles, dependency order, file ownership, required entry files, tests present, size)
+  and a deterministic plan is used if it is unusable.
 * **execute** – each agent makes one Gemini call and writes only its assigned
-  files through the permission-checked workspace tools (architect/QA/security →
-  `docs/`, backend → `backend/`, frontend → `frontend/`; path traversal blocked).
+  files through the permission-checked workspace tools; path traversal is blocked.
   Failed attempts are retried with the previous error fed back to the model.
-* **validate** – static checks: Python `ast` parse, imports resolve, assets exist,
-  every frontend `/api` call has a backend route, `node --check` for JavaScript if
-  Node is installed.
-* **smoke test** – the generated app is also *run once*: in a separate Python process
-  (project folder as working directory, API keys removed from the environment, 30 s
-  timeout) it imports `backend.main`, starts the app with FastAPI's test client and
-  requests `/` and the `/api` paths the frontend calls. **This executes generated
-  code.** Disable it with `--no-smoke-test` / `BuildConfig(smoke_test=False)`.
-* **repair** – QA/Security findings, static issues and smoke-test failures become fix
-  tasks (two rounds by default, `--repair-rounds`). Fix tasks may create missing
-  modules/assets and see the other files of their area.
+* **checks** – static: Python `ast` parse, package imports resolve, required files and
+  tests exist (web also checks assets and the API contract). Runtime: the project's entry
+  commands, then its own `pytest` suite, run in a separate Python process (project folder
+  as working directory, API keys removed from the environment, hard timeouts). **This
+  executes generated code.** Disable it with `--no-smoke-test` /
+  `BuildConfig(smoke_test=False)`. QA's review is given this evidence.
+* **repair** – QA/Security findings and check failures become fix tasks (two rounds by
+  default, `--repair-rounds`), routed to the role that owns the failing file. A failing
+  test creates a task for the code owner and one for QA, each told to change its side
+  only if that side is wrong. Fix tasks may create missing modules/assets and see the
+  other files of their area.
 * **scheduling** – ready tasks run in parallel threads, at most
   `BuildConfig.max_concurrent_llm` Gemini requests at once. With `--strategy
   adaptive` the deterministic controller observes the real queue between
@@ -181,10 +197,24 @@ How it works (`src/ekatra/build/`):
 * **output** – `ekatra-run.json` in the project holds the tasks, events, adaptive
   decisions, metrics and run config (model name, thresholds; never the key).
 
-Limits: the generated site is only as good as the model (`gemini-3.5-flash-lite`
+Limits: the generated software is only as good as the model (`gemini-3.5-flash-lite`
 is fast but sloppier than larger models), dead links and unfinished pages can
-remain after the repair rounds, and the smoke test only exercises startup, `/` and
-simple GET routes, not every feature. Gemini rate limits (429) and overload (503) are retried with backoff.
+remain after the repair rounds, and the runtime checks exercise entry points, simple GET routes and the generated
+tests, which can themselves be weak. Gemini rate limits (429) and overload (503) are retried with backoff.
+
+### Change or fix a finished project
+
+A finished project can be modified with a text request, from the dashboard (**Change or
+fix this project** panel under the Build tab) or `POST /api/builds/{id}/changes`
+(`{"request": "Add a dark mode toggle"}`). The Project Manager reads the file list and
+`docs/architecture.md` and plans the smallest set of tasks (validated like any plan: roles,
+write locations, one owner per file). Developers rewrite only their assigned files, QA
+updates the tests, then the normal checks and repair rounds run, so a change that breaks
+something is repaired or reported instead of hidden. Leave the text empty to only re-check
+the project and repair what the checks find ("Fix remaining issues"). If a change cannot
+be planned the project is left exactly as it was and the reason is shown. Each run is saved
+as `ekatra-change-N.json` in the project folder. Projects found in `projects/` are restored
+when the backend starts, so earlier builds can be changed after a restart.
 
 ## Backend API and Dashboard
 
@@ -214,12 +244,14 @@ Build endpoints (`/api/builds`; one build may run at a time):
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/builds` `{description, strategy, repair_rounds}` | start a real build (needs `GEMINI_API_KEY`) |
+| `POST /api/builds` `{description, strategy, repair_rounds, project_type}` | start a real build (needs `GEMINI_API_KEY`) |
 | `GET /api/builds` | recent builds, newest first |
 | `GET /api/builds/{id}` | full state: agents, tasks, decisions, workload, risk, metrics, events, files, log, issues |
 | `GET /api/builds/{id}/stream` | Server-Sent Events: one state snapshot per change, then `event: done` |
 | `GET /api/builds/{id}/files` / `.../files/{path}` | list / read generated files (confined to `backend/`, `frontend/`, `docs/`) |
-| `POST` / `GET` / `DELETE /api/builds/{id}/launch` | run / check / stop the generated site on localhost (executes generated code; at most 3 at once) |
+| `GET /api/build-profiles` | the supported project types with a summary and an example description |
+| `POST /api/builds/{id}/tests` / `.../demo` | run the generated project's `pytest` suite / demo command (Python types; executes generated code) |
+| `POST` / `GET` / `DELETE /api/builds/{id}/launch` | run / check / stop a generated web app or API on localhost (executes generated code; at most 3 at once) |
 
 Scenario endpoints (`/api/scenarios`, `/api/runs...`) are unchanged. Build state is kept in
 memory, so it is lost when the backend restarts (the files in `projects/` remain).

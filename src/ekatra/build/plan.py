@@ -1,26 +1,29 @@
 """LLM-driven project planning for real builds.
 
-The Project Manager asks Gemini to decompose a website description into tasks.
-The reply is *data*, never control flow: it is parsed and strictly validated
-(roles, dependencies, file ownership, size limits) before any task is created,
-and a deterministic fallback plan is used when the reply is unusable. The
-adaptive controller is unaffected - it only ever sees the validated tasks.
+The Project Manager asks Gemini to decompose a project description into tasks for the
+selected project profile (website, API, command-line tool, ...). The reply is *data*,
+never control flow: it is parsed and strictly validated (roles, dependencies, file
+ownership, size limits) before any task is created, and a deterministic fallback plan
+is used when the reply is unusable. The adaptive controller is unaffected - it only
+ever sees the validated tasks.
 """
 
 from __future__ import annotations
 
 import json
+import keyword
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
-from ekatra.agents.base import Role
+from ekatra.build.profiles import PYTHON_RESERVED, WEB, Profile
+from ekatra.build.types import PlannedTask
 
 # llm(prompt, json_mode) -> text. Injected so tests never touch the network.
 LLMFn = Callable[[str, bool], str]
 
 MAX_TASKS = 16
-# Where each role may write (matches tools.registry.WRITE_PREFIXES).
+# Where each role may write in the web profile (kept for compatibility).
 ROLE_PREFIX = {
     "architect": "docs/",
     "backend": "backend/",
@@ -28,7 +31,11 @@ ROLE_PREFIX = {
     "qa": "docs/",
     "security": "docs/",
 }
+PLAN_PROMPT = WEB.plan_prompt
 _KEY = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+_PACKAGE = re.compile(r"^[a-z][a-z0-9_]{1,24}$")
+_STOPWORDS = {"a", "an", "the", "of", "for", "and", "to", "in", "with", "python", "simple", "small", "command",
+              "line", "tool", "cli", "script", "library", "app", "application", "that", "which", "my"}
 
 
 class PlanError(ValueError):
@@ -36,15 +43,10 @@ class PlanError(ValueError):
 
 
 @dataclass
-class PlannedTask:
-    key: str
-    role: str
-    description: str
-    priority: int = 2
-    complexity: int = 3
-    risk: int = 20
-    dependencies: list[str] = field(default_factory=list)
-    deliverables: list[str] = field(default_factory=list)
+class Plan:
+    tasks: list[PlannedTask]
+    source: str          # "llm" or "fallback: <why>"
+    package: str = ""    # python profiles: the package directory name
 
 
 def extract_json(text: str) -> Any:
@@ -78,13 +80,49 @@ def _safe_path(path: Any) -> str:
     return cleaned
 
 
-def validate_plan(raw: Any) -> list[PlannedTask]:
-    """Validate a parsed LLM plan and return normalized tasks."""
+def valid_package(name: Any) -> bool:
+    return (isinstance(name, str) and bool(_PACKAGE.match(name)) and name not in PYTHON_RESERVED
+            and not keyword.iskeyword(name))
+
+
+def resolve_package(raw: Any, profile: Profile) -> str:
+    """The package directory for python profiles (empty for the web profile)."""
+    if profile.kind != "python":
+        return ""
+    name = raw.get("package") if isinstance(raw, dict) else None
+    if valid_package(name):
+        return name
+    items = raw.get("tasks") if isinstance(raw, dict) else raw
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        for path in item.get("deliverables") or []:
+            top = str(path).split("/")[0]
+            if item.get("role") in ("backend", "frontend") and valid_package(top):
+                return top
+    return "app"
+
+
+def fallback_package(description: str) -> str:
+    words = [w for w in re.findall(r"[a-z]+", description.lower()) if w not in _STOPWORDS and len(w) > 1]
+    name = "_".join(words[:2])[:24]
+    return name if valid_package(name) else "app"
+
+
+def validate_plan(raw: Any, profile: Profile = WEB, package: str | None = None, *,
+                  strict: bool = True) -> list[PlannedTask]:
+    """Validate a parsed LLM plan for ``profile`` and return normalized tasks.
+
+    ``strict=False`` is used for change requests: the per-task rules (roles, write
+    locations, dependencies, file ownership) still apply, but the plan need not contain
+    every role, the entry files or the tests - those already exist in the project.
+    """
     items = raw.get("tasks") if isinstance(raw, dict) else raw
     if not isinstance(items, list) or not items:
         raise PlanError("plan must contain a non-empty 'tasks' list")
     if len(items) > MAX_TASKS:
         raise PlanError(f"plan has {len(items)} tasks; the limit is {MAX_TASKS}")
+    pkg = package if package is not None else resolve_package(raw, profile)
 
     tasks: list[PlannedTask] = []
     seen: set[str] = set()
@@ -95,7 +133,7 @@ def validate_plan(raw: Any) -> list[PlannedTask]:
         key, role = str(item.get("key", "")).strip(), str(item.get("role", "")).strip()
         if not _KEY.match(key) or key in seen:
             raise PlanError(f"invalid or duplicate task key {key!r}")
-        if role not in ROLE_PREFIX:
+        if role not in profile.allowed_roles:
             raise PlanError(f"task {key!r} has unsupported role {role!r}")
         description = str(item.get("description", "")).strip()
         if not description:
@@ -107,9 +145,10 @@ def validate_plan(raw: Any) -> list[PlannedTask]:
         deliverables = [_safe_path(p) for p in item.get("deliverables") or []]
         if not deliverables:
             raise PlanError(f"task {key!r} must declare at least one deliverable")
+        prefixes = profile.prefixes_for(role, pkg)
         for path in deliverables:
-            if not path.startswith(ROLE_PREFIX[role]):
-                raise PlanError(f"{role} task {key!r} may only write under {ROLE_PREFIX[role]}: {path}")
+            if not path.startswith(prefixes):
+                raise PlanError(f"{role} task {key!r} may only write under {', '.join(prefixes)}: {path}")
             if path in owned:
                 raise PlanError(f"{path} is owned by both {owned[path]!r} and {key!r}")
             owned[path] = key
@@ -127,88 +166,57 @@ def validate_plan(raw: Any) -> list[PlannedTask]:
             )
         )
 
+    if not strict:
+        return tasks
     roles = {t.role for t in tasks}
-    for needed in ("architect", "backend", "frontend", "qa", "security"):
+    for needed in profile.required_roles:
         if needed not in roles:
             raise PlanError(f"plan has no {needed} task")
-    if "backend/main.py" not in owned or "frontend/index.html" not in owned:
-        raise PlanError("plan must deliver backend/main.py and frontend/index.html")
+    required = profile.required(pkg)
+    if any(path not in owned for path in required):
+        raise PlanError(f"plan must deliver {' and '.join(required)}")
+    if profile.kind == "python":
+        qa_owned = {t.key for t in tasks if t.role == "qa"}
+        if not any(p.startswith("tests/test_") and p.endswith(".py") and k in qa_owned for p, k in owned.items()):
+            raise PlanError("plan must include QA tests as tests/test_*.py files")
     return tasks
 
 
-def fallback_plan(description: str) -> list[PlannedTask]:
+def fallback_plan(description: str, profile: Profile = WEB, package: str = "") -> list[PlannedTask]:
     """A small deterministic plan used when the LLM plan is unusable."""
-    return [
-        PlannedTask("architecture", "architect",
-                    f"Design the architecture, REST API contract and data model for: {description}",
-                    3, 3, 10, [], ["docs/architecture.md"]),
-        PlannedTask("backend_core", "backend",
-                    "Implement the data layer and business logic as described in docs/architecture.md.",
-                    3, 4, 25, ["architecture"], ["backend/__init__.py", "backend/store.py"]),
-        PlannedTask("backend_api", "backend",
-                    "Implement backend/main.py: the FastAPI app, the /api routes from the contract, "
-                    "and serve the frontend/ folder as static files at '/'.",
-                    3, 3, 30, ["architecture", "backend_core"], ["backend/main.py"]),
-        PlannedTask("frontend_page", "frontend",
-                    "Implement frontend/index.html and frontend/style.css for the site.",
-                    2, 3, 15, ["architecture"], ["frontend/index.html", "frontend/style.css"]),
-        PlannedTask("frontend_app", "frontend",
-                    "Implement frontend/app.js: calls the /api routes from the contract and renders data.",
-                    2, 3, 20, ["architecture", "frontend_page"], ["frontend/app.js"]),
-        PlannedTask("qa", "qa", "Review the whole project for defects and contract mismatches.",
-                    3, 2, 20, ["backend_api", "frontend_app"], ["docs/qa-report.md"]),
-        PlannedTask("security", "security", "Review the project for security weaknesses.",
-                    3, 2, 40, ["backend_api", "frontend_app"], ["docs/security-report.md"]),
-    ]
+    return profile.fallback(description, package)
 
 
-PLAN_PROMPT = """You are the Project Manager of a software team building a small, complete, \
-working website from this description:
-
-{description}
-
-Decompose the work into between 8 and 14 tasks. Return ONLY a JSON object:
-{{"tasks": [{{"key": "snake_case_id", "role": "architect|backend|frontend|qa|security",
-  "description": "what to do, specific", "priority": 1-3, "complexity": 1-5, "risk": 0-100,
-  "dependencies": ["keys of EARLIER tasks"], "deliverables": ["files this task writes"]}}]}}
-
-Rules:
-- Exactly one architect task first, key "architecture", deliverable "docs/architecture.md". It defines
-  the page list, REST API contract (paths under /api, JSON shapes), data model and file layout.
-- Backend files live under backend/, frontend files under frontend/ (static HTML/CSS/vanilla JS, no
-  build step). QA and security tasks write one report each under docs/.
-- The backend is a FastAPI app. backend/main.py defines `app`, mounts the frontend/ folder as static
-  files at "/" AFTER the /api routes, and includes the other backend modules. Include
-  backend/__init__.py. Data lives in memory or a local SQLite file; use only the standard library plus
-  fastapi/uvicorn.
-- Split work so several developers can work in parallel: several independent backend modules and
-  several independent frontend pages/scripts. Integration files (backend/main.py,
-  frontend/index.html) must depend on the other tasks of their role.
-- Every file has exactly one owning task (no two tasks list the same deliverable).
-- QA and security tasks depend on all developer tasks.
-- Use real, concrete features for the description; no placeholders.
-"""
+def render_plan_prompt(profile: Profile, description: str) -> str:
+    return profile.plan_prompt.replace("{pkg}", "<package>").format(description=description)
 
 
-def plan_project(description: str, llm: LLMFn) -> tuple[list[PlannedTask], str]:
-    """Ask the LLM for a plan; fall back to the deterministic plan on failure.
-
-    Returns ``(tasks, source)`` where source is ``"llm"`` or ``"fallback: <why>"``.
-    """
+def plan_project_full(description: str, llm: LLMFn, profile: Profile = WEB) -> Plan:
+    """Ask the LLM for a plan; fall back to the deterministic plan on failure."""
     reason = "no attempt"
+    prompt = render_plan_prompt(profile, description)
     for _ in range(2):
         try:
-            reply = llm(PLAN_PROMPT.format(description=description), True)
-            return validate_plan(extract_json(reply)), "llm"
+            raw = extract_json(llm(prompt, True))
+            pkg = resolve_package(raw, profile)
+            return Plan(validate_plan(raw, profile, pkg), "llm", pkg)
         except (PlanError, json.JSONDecodeError) as exc:
             reason = str(exc)[:200]
         except Exception as exc:  # noqa: BLE001 - provider failure
             reason = f"{type(exc).__name__}: {str(exc)[:160]}"
             break
-    return fallback_plan(description), f"fallback: {reason}"
+    pkg = fallback_package(description) if profile.kind == "python" else ""
+    return Plan(fallback_plan(description, profile, pkg), f"fallback: {reason}", pkg)
+
+
+def plan_project(description: str, llm: LLMFn, profile: Profile = WEB) -> tuple[list[PlannedTask], str]:
+    """``(tasks, source)`` where source is ``"llm"`` or ``"fallback: <why>"``."""
+    plan = plan_project_full(description, llm, profile)
+    return plan.tasks, plan.source
 
 
 __all__ = [
-    "LLMFn", "MAX_TASKS", "PlanError", "PlannedTask", "ROLE_PREFIX",
-    "extract_json", "fallback_plan", "plan_project", "validate_plan",
+    "LLMFn", "MAX_TASKS", "PLAN_PROMPT", "Plan", "PlanError", "PlannedTask", "ROLE_PREFIX",
+    "extract_json", "fallback_package", "fallback_plan", "plan_project", "plan_project_full",
+    "render_plan_prompt", "resolve_package", "valid_package", "validate_plan",
 ]
